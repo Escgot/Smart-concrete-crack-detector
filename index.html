@@ -210,8 +210,42 @@ tr:hover td{background:var(--card2);}
 .geo-btn:hover{border-color:var(--green3);color:var(--green);}
 
 /* ─ Overlay img ─ */
-.overlay-wrap{border-radius:8px;overflow:hidden;margin-top:8px;}
+.overlay-wrap{border-radius:8px;overflow:hidden;}
 .overlay-wrap img{width:100%;display:block;}
+
+/* ─ Phase 2: Detection mode badge ─ */
+.mode-badge{
+  display:inline-flex;align-items:center;gap:5px;
+  font-family:var(--mono);font-size:10px;letter-spacing:.05em;
+  padding:3px 9px;border-radius:12px;
+  text-transform:uppercase;font-weight:500;
+}
+.mode-det  {background:#39ff7a18;color:var(--green);border:1px solid #39ff7a30;}
+.mode-cls  {background:#ffe44d18;color:var(--yellow);border:1px solid #ffe44d30;}
+.mode-mock {background:#3a3a4a;color:var(--text2);border:1px solid var(--border2);}
+
+/* ─ Phase 2: Bounding box list ─ */
+.box-list{display:flex;flex-direction:column;gap:4px;margin-top:2px;}
+.box-row{
+  display:grid;grid-template-columns:auto 1fr auto auto;
+  gap:8px;align-items:center;
+  padding:5px 8px;border-radius:6px;
+  background:var(--surface);border:1px solid var(--border);
+  font-family:var(--mono);font-size:11px;
+}
+.box-idx{color:var(--text3);}
+.box-coords{color:var(--text2);font-size:10px;overflow:hidden;white-space:nowrap;}
+.box-sev{}
+.box-conf{color:var(--text);}
+
+/* ─ Phase 2: Overlay canvas wrapper (for box drawing preview) ─ */
+.overlay-container{position:relative;border-radius:8px;overflow:hidden;}
+.overlay-container img{width:100%;display:block;}
+
+/* ─ Stats by mode row ─ */
+.mode-stats{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px;}
+.mode-stat{font-family:var(--mono);font-size:11px;color:var(--text2);}
+.mode-stat span{color:var(--text);}
 </style>
 </head>
 <body>
@@ -220,7 +254,7 @@ tr:hover td{background:var(--card2);}
   <div class="logo"><div class="logo-crack"></div></div>
   <div>
     <div class="hdr-title">CrackScan</div>
-    <div class="hdr-sub">EN 206 · AI-powered concrete inspection</div>
+    <div class="hdr-sub">EN 206 · Phase 2 — Bounding Box Detection</div>
   </div>
   <nav class="hdr-nav">
     <button class="nav-btn active" id="navScan" onclick="showView('scan')">Inspect</button>
@@ -289,6 +323,7 @@ tr:hover td{background:var(--card2);}
     <div class="stat-card"><div class="stat-n" id="sCracked" style="color:var(--red)">—</div><div class="stat-l">Cracked</div></div>
     <div class="stat-card"><div class="stat-n" id="sUncracked">—</div><div class="stat-l">Uncracked</div></div>
     <div class="stat-card"><div class="stat-n" id="sRate" style="color:var(--orange)">—</div><div class="stat-l">Crack rate</div></div>
+    <div class="stat-card"><div class="stat-n" id="sBoxes" style="color:var(--yellow)">—</div><div class="stat-l">Avg boxes / crack</div></div>
   </div>
 
   <div class="table-wrap">
@@ -296,7 +331,7 @@ tr:hover td{background:var(--card2);}
       <thead>
         <tr>
           <th>#</th><th>Date</th><th>Result</th><th>Severity</th>
-          <th>Confidence</th><th>Location</th><th>Note</th>
+          <th>Confidence</th><th>Boxes</th><th>Mode</th><th>Location</th><th>Note</th>
         </tr>
       </thead>
       <tbody id="inspTable"><tr><td colspan="7" style="text-align:center;color:var(--text3);padding:2rem;">Loading…</td></tr></tbody>
@@ -421,6 +456,35 @@ function renderResults(d, panel) {
   const crackedProb = ((d.class_probabilities.cracked||0)*100).toFixed(1);
   const uncrProb    = ((d.class_probabilities.uncracked||0)*100).toFixed(1);
 
+  // Detection mode badge
+  const modeLabel = {detection:'Phase 2 · Detection', classification:'Phase 1 · Classification', mock:'Mock · Dev'}[d.detection_mode] || d.detection_mode;
+  const modeCls   = {detection:'mode-det', classification:'mode-cls', mock:'mode-mock'}[d.detection_mode] || 'mode-mock';
+
+  // Bounding box list HTML (Phase 2 only)
+  let boxesHtml = '';
+  if (d.bounding_boxes && d.bounding_boxes.length > 0) {
+    const rows = d.bounding_boxes.map((b, i) => `
+      <div class="box-row">
+        <span class="box-idx">#${i+1}</span>
+        <span class="box-coords">(${b.x1},${b.y1}) → (${b.x2},${b.y2}) · ${b.width}×${b.height}px</span>
+        <span class="sev-chip ${sevClass(b.severity)}" style="font-size:9px;padding:2px 7px;">
+          <span class="sev-dot" style="background:${sevColor(b.severity)};width:5px;height:5px;"></span>${b.severity}
+        </span>
+        <span class="box-conf">${(b.confidence*100).toFixed(0)}%</span>
+      </div>
+    `).join('');
+    boxesHtml = `
+    <div class="result-card">
+      <div class="rc-header">
+        <span class="rc-title">Detected Crack Regions</span>
+        <span style="font-family:var(--mono);font-size:11px;color:var(--text2)">${d.bounding_boxes.length} box${d.bounding_boxes.length!==1?'es':''}</span>
+      </div>
+      <div class="rc-body">
+        <div class="box-list">${rows}</div>
+      </div>
+    </div>`;
+  }
+
   panel.innerHTML = `
     <!-- Verdict -->
     <div class="verdict ${cracked?'cracked':'uncracked'}">
@@ -428,6 +492,7 @@ function renderResults(d, panel) {
       <div>
         <div class="verdict-label">${cracked?'CRACK DETECTED':'NO CRACK'}</div>
         <div class="verdict-conf">Confidence: ${conf}% · ID #${d.inspection_id}</div>
+        <div style="margin-top:6px;"><span class="mode-badge ${modeCls}">${modeLabel}</span></div>
       </div>
     </div>
 
@@ -454,6 +519,8 @@ function renderResults(d, panel) {
       ${d.action}
     </div>`}
 
+    ${boxesHtml}
+
     <!-- Class probabilities -->
     <div class="result-card">
       <div class="rc-header"><span class="rc-title">Class probabilities</span></div>
@@ -462,16 +529,20 @@ function renderResults(d, panel) {
         <div class="kv"><span class="kv-k">Uncracked</span><span class="kv-v" style="color:var(--green)">${uncrProb}%</span></div>
         <div class="kv"><span class="kv-k">Inference time</span><span class="kv-v">${d.inference_time_ms} ms</span></div>
         <div class="kv"><span class="kv-k">Model</span><span class="kv-v">${d.model_version}</span></div>
+        ${d.box_count > 0 ? `<div class="kv"><span class="kv-k">Boxes found</span><span class="kv-v" style="color:var(--yellow)">${d.box_count}</span></div>` : ''}
       </div>
     </div>
 
-    ${cracked && d.overlay_url ? `
-    <!-- Overlay image -->
+    ${d.overlay_url ? `
+    <!-- Overlay image (with bounding boxes drawn by backend) -->
     <div class="result-card">
-      <div class="rc-header"><span class="rc-title">Crack overlay</span></div>
+      <div class="rc-header">
+        <span class="rc-title">${d.detection_mode==='detection' ? 'Bounding Box Overlay' : 'Crack Overlay'}</span>
+        ${d.detection_mode==='detection' ? '<span style="font-family:var(--mono);font-size:10px;color:var(--green)">● Phase 2</span>' : ''}
+      </div>
       <div class="rc-body" style="padding:8px;">
-        <div class="overlay-wrap">
-          <img src="${API}${d.overlay_url}" alt="crack overlay"/>
+        <div class="overlay-container">
+          <img src="${API}${d.overlay_url}" alt="crack overlay" style="border-radius:6px;"/>
         </div>
       </div>
     </div>` : ''}
@@ -500,12 +571,13 @@ function renderStats(s) {
   document.getElementById('sCracked').textContent = s.cracked;
   document.getElementById('sUncracked').textContent = s.uncracked;
   document.getElementById('sRate').textContent = s.crack_rate_pct + '%';
+  document.getElementById('sBoxes').textContent = s.avg_boxes_per_crack ?? '—';
 }
 
 function renderTable(rows) {
   const tbody = document.getElementById('inspTable');
   if (!rows.length) {
-    tbody.innerHTML = `<tr><td colspan="7" style="text-align:center;color:var(--text3);padding:2rem;font-family:var(--mono);font-size:12px;">No inspections yet</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="9" style="text-align:center;color:var(--text3);padding:2rem;font-family:var(--mono);font-size:12px;">No inspections yet</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.map(r => {
@@ -513,6 +585,9 @@ function renderTable(rows) {
     const sev = r.severity;
     const conf = (r.confidence * 100).toFixed(0);
     const loc = r.location_name || (r.latitude ? `${r.latitude.toFixed(4)}, ${r.longitude.toFixed(4)}` : '—');
+    const modeLabel = {detection:'Det', classification:'Cls', mock:'Mock'}[r.detection_mode] || r.detection_mode || 'Cls';
+    const modeCls   = {detection:'mode-det', classification:'mode-cls', mock:'mode-mock'}[r.detection_mode] || 'mode-cls';
+    const boxCount  = r.box_count != null ? r.box_count : (r.bounding_boxes ? r.bounding_boxes.length : '—');
     return `<tr>
       <td style="font-family:var(--mono);color:var(--text3)">#${r.id}</td>
       <td style="font-family:var(--mono);font-size:11px;color:var(--text2)">${date}</td>
@@ -521,6 +596,8 @@ function renderTable(rows) {
         <span class="sev-dot" style="background:${sevColor(sev)}"></span>${sev}
       </span></td>
       <td style="font-family:var(--mono)">${conf}%</td>
+      <td style="font-family:var(--mono);color:${r.box_count>0?'var(--yellow)':'var(--text3)'}">${boxCount}</td>
+      <td><span class="mode-badge ${modeCls}" style="font-size:9px">${modeLabel}</span></td>
       <td style="font-size:11px;color:var(--text2)">${loc}</td>
       <td style="font-size:11px;color:var(--text2)">${r.user_note||'—'}</td>
     </tr>`;
