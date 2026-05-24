@@ -1,6 +1,11 @@
 """
-Concrete Crack Detector API — FastAPI
-Endpoints: /detect (image upload), /inspections (log), /stats (dashboard)
+Concrete Crack Detector API — FastAPI  (Phase 2: Bounding Box Detection)
+=========================================================================
+Endpoints:
+  POST /detect          — image upload → crack detection + bounding boxes
+  GET  /inspections     — inspection log (paginated)
+  GET  /stats           — dashboard statistics
+  DELETE /inspections/{id}
 
 Run:
     uvicorn api.main:app --reload --port 8001
@@ -18,11 +23,16 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from api.detector import load_detector, draw_severity_overlay, DetectionResult
+from api.detector import (
+    load_detector,
+    draw_boxes_overlay,
+    draw_severity_overlay,
+    DetectionResult,
+)
 from api import database as db
 
 # ---------------------------------------------------------------------------
@@ -35,11 +45,13 @@ UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 app = FastAPI(
     title="Concrete Crack Detector API",
     description=(
-        "AI-powered concrete surface crack detection.\n\n"
-        "Upload an image → get crack classification, severity, and recommended action.\n"
-        "All inspections are logged with optional GPS coordinates."
+        "AI-powered concrete surface crack detection with bounding box localisation.\n\n"
+        "Upload an image → get crack classification, bounding boxes, severity,\n"
+        "and recommended action. All inspections are logged with optional GPS.\n\n"
+        "**Model priority**: Phase 2 detection (crack_detector_det.onnx) → "
+        "Phase 1 classification (crack_detector.onnx) → MockDetector."
     ),
-    version="1.0.0",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -49,40 +61,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve uploaded images
 app.mount("/uploads", StaticFiles(directory=str(UPLOADS_DIR)), name="uploads")
 
-# Load detector at startup (once)
 detector = None
+
 
 @app.on_event("startup")
 def startup():
     global detector
     db.init_db()
     detector = load_detector()
-    print("[startup] API ready.")
+    mode = getattr(detector, '__class__', type(detector)).__name__
+    print(f"[startup] API ready — detector: {mode}")
 
 
 # ---------------------------------------------------------------------------
 # Schemas
 # ---------------------------------------------------------------------------
 
-class InspectionOut(BaseModel):
-    id: int
-    created_at: str
-    is_cracked: bool
+class BoundingBoxOut(BaseModel):
+    x1: int
+    y1: int
+    x2: int
+    y2: int
+    width: int
+    height: int
     confidence: float
     severity: str
-    severity_color: str
-    action: str
-    class_probs: dict
-    infer_ms: float
-    latitude: Optional[float]
-    longitude: Optional[float]
-    location_name: Optional[str]
-    user_note: Optional[str]
-    image_url: Optional[str]
-    model_ver: str
 
 
 class DetectResponse(BaseModel):
@@ -96,6 +101,9 @@ class DetectResponse(BaseModel):
     inference_time_ms: float
     overlay_url: str
     model_version: str
+    detection_mode: str                     # "detection" | "classification" | "mock"
+    bounding_boxes: list[BoundingBoxOut]    # empty list for cls/mock modes
+    box_count: int
 
 
 class StatsResponse(BaseModel):
@@ -111,20 +119,21 @@ class StatsResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 ALLOWED_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp"}
-MAX_SIZE_MB = 10
+MAX_SIZE_MB   = 10
 
 
 def read_image(file_bytes: bytes) -> np.ndarray:
-    """Decode uploaded bytes to BGR numpy array."""
     arr = np.frombuffer(file_bytes, np.uint8)
     img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
     if img is None:
-        raise HTTPException(status_code=422, detail="Could not decode image. Ensure it is a valid JPEG/PNG.")
+        raise HTTPException(
+            status_code=422,
+            detail="Could not decode image. Ensure it is a valid JPEG/PNG/WebP.",
+        )
     return img
 
 
 def save_image(img_bgr: np.ndarray, suffix: str = "") -> tuple[str, str]:
-    """Save image to uploads dir. Returns (filename, URL path)."""
     filename = f"{uuid.uuid4().hex}{suffix}.jpg"
     path = UPLOADS_DIR / filename
     cv2.imwrite(str(path), img_bgr)
@@ -137,34 +146,37 @@ def save_image(img_bgr: np.ndarray, suffix: str = "") -> tuple[str, str]:
 
 @app.get("/", tags=["Health"])
 def root():
+    mode = getattr(detector, "__class__", type(detector)).__name__
     return {
         "status": "ok",
-        "model": getattr(detector, "__class__", type(detector)).__name__,
-        "message": "Concrete Crack Detector API — see /docs",
+        "phase": 2,
+        "detector": mode,
+        "message": "CrackScan API v2 — bounding box detection active. See /docs",
     }
 
 
 @app.post("/detect", response_model=DetectResponse, tags=["Detection"])
 async def detect(
-    file: UploadFile = File(..., description="Concrete surface image (JPEG/PNG/WebP)"),
-    latitude:      Optional[float] = Form(None, description="GPS latitude"),
-    longitude:     Optional[float] = Form(None, description="GPS longitude"),
-    location_name: Optional[str]   = Form(None, description="Human-readable location"),
-    user_note:     Optional[str]   = Form(None, description="Inspector note"),
+    file:          UploadFile        = File(..., description="Concrete surface image (JPEG/PNG/WebP)"),
+    latitude:      Optional[float]   = Form(None, description="GPS latitude"),
+    longitude:     Optional[float]   = Form(None, description="GPS longitude"),
+    location_name: Optional[str]     = Form(None, description="Human-readable location"),
+    user_note:     Optional[str]     = Form(None, description="Inspector note"),
+    conf_threshold: Optional[float]  = Form(None, description="Override detection confidence threshold (0.1–0.9)"),
 ):
     """
-    Upload a concrete surface image and get:
-    - Binary classification: cracked / uncracked
-    - Severity: none / hairline / moderate / severe
-    - Recommended action
-    - Annotated overlay image URL
-    - Inspection saved to the log
+    Upload a concrete surface image and receive:
+
+    - **is_cracked**: binary classification
+    - **bounding_boxes**: list of detected crack regions (Phase 2 model only)
+    - **severity**: worst-case severity across all boxes
+    - **overlay_url**: annotated image with coloured bounding boxes drawn
+    - **detection_mode**: `detection` | `classification` | `mock`
     """
-    # Validate
     if file.content_type not in ALLOWED_TYPES:
         raise HTTPException(
             status_code=415,
-            detail=f"Unsupported file type: {file.content_type}. Use JPEG, PNG, or WebP."
+            detail=f"Unsupported type: {file.content_type}. Use JPEG, PNG, or WebP.",
         )
 
     raw = await file.read()
@@ -176,12 +188,18 @@ async def detect(
     # Run detection
     result: DetectionResult = detector.predict(img)
 
-    # Save original + overlay
-    _, orig_url = save_image(img, "_orig")
-    overlay_img  = draw_severity_overlay(img) if result.is_cracked else img
+    # Build annotated overlay
+    if result.detection_mode == "detection" and result.bounding_boxes:
+        overlay_img = draw_boxes_overlay(img, result.bounding_boxes)
+    elif result.is_cracked:
+        overlay_img = draw_severity_overlay(img)   # Phase 1 contour fallback
+    else:
+        overlay_img = img
+
+    _, orig_url    = save_image(img, "_orig")
     _, overlay_url = save_image(overlay_img, "_overlay")
 
-    # Log to database
+    # Persist to DB
     inspection_id = db.save_inspection(
         is_cracked=result.is_cracked,
         confidence=result.confidence,
@@ -195,6 +213,8 @@ async def detect(
         location_name=location_name,
         user_note=user_note,
         model_ver=result.model_version,
+        bounding_boxes=result.boxes_as_dicts(),
+        detection_mode=result.detection_mode,
     )
 
     return DetectResponse(
@@ -208,17 +228,21 @@ async def detect(
         inference_time_ms=result.inference_time_ms,
         overlay_url=overlay_url,
         model_version=result.model_version,
+        detection_mode=result.detection_mode,
+        bounding_boxes=[BoundingBoxOut(**b) for b in result.boxes_as_dicts()],
+        box_count=len(result.bounding_boxes),
     )
 
 
 @app.get("/inspections", tags=["Log"])
 def list_inspections(
-    limit:    int = Query(50, ge=1, le=200),
-    offset:   int = Query(0, ge=0),
+    limit:    int            = Query(50, ge=1, le=200),
+    offset:   int            = Query(0, ge=0),
     severity: Optional[str] = Query(None, description="Filter: none/hairline/moderate/severe"),
+    mode:     Optional[str] = Query(None, description="Filter by detection_mode: detection/classification/mock"),
 ):
     """Return paginated inspection history, newest first."""
-    rows = db.get_inspections(limit=limit, offset=offset, severity=severity)
+    rows = db.get_inspections(limit=limit, offset=offset, severity=severity, mode=mode)
     return {"count": len(rows), "inspections": rows}
 
 
@@ -230,7 +254,6 @@ def stats():
 
 @app.delete("/inspections/{inspection_id}", tags=["Log"])
 def delete_inspection(inspection_id: int):
-    """Delete an inspection record by ID."""
     deleted = db.delete_inspection(inspection_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Inspection not found.")
