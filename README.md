@@ -185,13 +185,6 @@ The frontend uses the standard browser camera API — it already works on mobile
 
 ---
 
-## CV / Portfolio Notes
-
-- 30 tests, 100% passing — mention this
-- ONNX export means **no GPU needed in production** — mention this
-- MockDetector means the API and frontend are fully demoable without training — useful for live demos
-- The inspection log + dashboard turns it from a classifier into an **asset management tool** — frame it this way on your CV
-
 ## License
 
 MIT
