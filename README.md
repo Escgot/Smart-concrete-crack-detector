@@ -143,6 +143,7 @@ Fetch aggregated dashboard statistics (total logs, crack rates, severity distrib
 | Severe   | Wide crack, > ~0.5 mm | Immediate structural assessment |
 
 ⚠️ Disclaimer: This automated heuristic is indicative only. It is designed to assist asset managers in triaging field data and should always be confirmed with a professional structural assessment.
+
 ---
 
 ## 🌐 Deployment Architecture
