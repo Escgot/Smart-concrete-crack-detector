@@ -2,263 +2,399 @@
 # Concrete Crack Detector — Training Notebook
 # Run cell-by-cell in Google Colab (free T4 GPU)
 #
-# Dataset: SDNET2018 — 56,000 labelled concrete crack images
-# Model:   YOLOv8 classification (ultralytics)
-# Output:  best.pt  →  crack_detector.onnx
+# Two paths:
+#   Path A (Fast):   Download a pre-labelled detection dataset from Roboflow
+#   Path B (Advanced): Auto-label SDNET2018 with Grounding DINO + SAM
+#
+# Output: crack_detector_det.onnx  →  place in api/models/
 # ============================================================
 
-# ── CELL 1: Check GPU ────────────────────────────────────────
+
+# ── CELL 1: GPU check ────────────────────────────────────────
 import torch
 print("CUDA available:", torch.cuda.is_available())
 print("Device:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
-# Expected: Tesla T4 on Colab free tier
+
 
 # ── CELL 2: Install dependencies ─────────────────────────────
-# !pip install ultralytics kagglehub opencv-python-headless albumentations -q
+# !pip install ultralytics roboflow supervision -q
+# For Path B auto-labeling:
+# !pip install groundingdino-py segment-anything -q
 
-# ── CELL 3: Download SDNET2018 from Kaggle ───────────────────
-# Option A — Kaggle API (recommended, fastest)
-# Upload your kaggle.json first: Files → Upload
-# !mkdir -p ~/.kaggle && cp kaggle.json ~/.kaggle/ && chmod 600 ~/.kaggle/kaggle.json
-# !kaggle datasets download -d arunrk7/surface-crack-detection -p /content/data --unzip
 
-# Option B — Direct from UCI (no account needed, slower)
-import os, urllib.request, zipfile
+# ═══════════════════════════════════════════════════════════════
+# PATH A — Pre-labelled dataset from Roboflow (RECOMMENDED)
+# ═══════════════════════════════════════════════════════════════
 
-DATA_ROOT = "/content/data"
-os.makedirs(DATA_ROOT, exist_ok=True)
-
-# SDNET2018 is hosted on Mendeley Data — download the zip
-# If the URL changes, search "SDNET2018 dataset download"
-UCI_URL = "https://digitalcommons.usu.edu/cgi/viewcontent.cgi?filename=0&article=1047&context=all_datasets&type=additional"
-# NOTE: For Colab, use the Kaggle route (Option A) — it is more reliable.
-# The dataset has two folders: Positive (cracked) and Negative (uncracked)
-print("Download dataset via Kaggle (Option A) or manually place images in:")
-print(f"  {DATA_ROOT}/Positive/  ← cracked images")
-print(f"  {DATA_ROOT}/Negative/  ← uncracked images")
-
-# ── CELL 4: Explore the dataset ──────────────────────────────
-import os
-from pathlib import Path
-
-# After download, SDNET2018 has structure:
-#   surface-crack-detection/
-#     Positive/  (cracked)   — 20,000 images
-#     Negative/  (uncracked) — 20,000 images
-# We'll also add a SEVERITY sub-task after binary classification.
-
-data_dir = Path("/content/data/surface-crack-detection")
-pos = list((data_dir / "Positive").glob("*.jpg"))
-neg = list((data_dir / "Negative").glob("*.jpg"))
-print(f"Cracked images:   {len(pos)}")
-print(f"Uncracked images: {len(neg)}")
-
-import random
-import matplotlib.pyplot as plt
-import cv2
-
-fig, axes = plt.subplots(2, 4, figsize=(14, 7))
-for i, img_path in enumerate(random.sample(pos, 4)):
-    img = cv2.imread(str(img_path))
-    axes[0, i].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    axes[0, i].set_title("Cracked", color="tomato")
-    axes[0, i].axis("off")
-for i, img_path in enumerate(random.sample(neg, 4)):
-    img = cv2.imread(str(img_path))
-    axes[1, i].imshow(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-    axes[1, i].set_title("Uncracked", color="limegreen")
-    axes[1, i].axis("off")
-plt.tight_layout()
-plt.savefig("/content/dataset_samples.png", dpi=120)
-plt.show()
-
-# ── CELL 5: Organise into YOLOv8 classification structure ────
+# ── CELL 3A: Download pre-labelled crack detection dataset ────
 #
-# YOLOv8-cls expects:
+# Option 1: Use the Roboflow API (free account required)
+#
+from roboflow import Roboflow
+rf = Roboflow(api_key="YOUR_ROBOFLOW_API_KEY")  # sign up at roboflow.com
+
+# Search roboflow.com for "concrete crack detection" datasets.
+# Good public datasets:
+#   - "Crack Detection" by Roboflow (concrete-crack-detection)
+#   - "Bridge Crack" dataset
+#   - "SDNET Detection" (pre-annotated version)
+#
+project = rf.workspace("YOUR_WORKSPACE").project("concrete-crack-detection")
+dataset = project.version(1).download("yolov8")
+DATASET_YAML = dataset.location + "/data.yaml"
+print("Dataset downloaded to:", dataset.location)
+
+#
+# Option 2: Manual download — go to https://universe.roboflow.com
+# Search "concrete crack" → Export → YOLOv8 format → Download ZIP
+# Unzip to /content/crack_dataset/ and set:
+# DATASET_YAML = "/content/crack_dataset/data.yaml"
+
+
+# ═══════════════════════════════════════════════════════════════
+# PATH B — Auto-label SDNET2018 with Grounding DINO + SAM
+# (Keeps your existing dataset; produces YOLO-format labels)
+# ═══════════════════════════════════════════════════════════════
+
+# ── CELL 3B: Setup Grounding DINO ────────────────────────────
+#
+# Grounding DINO is a zero-shot open-set object detector.
+# We prompt it with the text "crack" to find crack regions.
+#
+
+import os, sys
+from pathlib import Path
+import cv2
+import numpy as np
+import json
+
+# Clone and install Grounding DINO
+# !git clone https://github.com/IDEA-Research/GroundingDINO.git /content/GroundingDINO -q
+# %cd /content/GroundingDINO
+# !pip install -e . -q
+# %cd /content
+
+# Download weights
+# !mkdir -p /content/weights
+# !wget -q https://github.com/IDEA-Research/GroundingDINO/releases/download/v0.1.0-alpha/groundingdino_swint_ogc.pth \
+#       -O /content/weights/groundingdino_swint_ogc.pth
+
+SDNET_DIR      = Path("/content/data/surface-crack-detection/Positive")  # cracked images only
+LABELS_OUT_DIR = Path("/content/auto_labels/cracked")
+LABELS_OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ── CELL 4B: Run zero-shot auto-labeling ─────────────────────
+#
+# NOTE: This is the "AI-Engineering Path" — it uses Grounding DINO
+# to generate bounding box annotations automatically.
+# Expect ~80–85% IoU quality vs human labels. Sufficient for training.
+#
+
+from groundingdino.util.inference import load_model, load_image, predict, annotate
+
+MODEL_CONFIG = "/content/GroundingDINO/groundingdino/config/GroundingDINO_SwinT_OGC.py"
+MODEL_WEIGHTS = "/content/weights/groundingdino_swint_ogc.pth"
+
+model = load_model(MODEL_CONFIG, MODEL_WEIGHTS)
+
+TEXT_PROMPT    = "crack . concrete crack . surface crack"
+BOX_THRESHOLD  = 0.25
+TEXT_THRESHOLD = 0.25
+
+images = list(SDNET_DIR.glob("*.jpg"))[:5000]  # use first 5k for speed
+print(f"Auto-labeling {len(images)} cracked images...")
+
+skipped = 0
+for img_path in images:
+    image_source, image = load_image(str(img_path))
+    h, w = image_source.shape[:2]
+
+    boxes, logits, phrases = predict(
+        model=model,
+        image=image,
+        caption=TEXT_PROMPT,
+        box_threshold=BOX_THRESHOLD,
+        text_threshold=TEXT_THRESHOLD,
+    )
+
+    if len(boxes) == 0:
+        skipped += 1
+        continue
+
+    # Save YOLO-format label file  (class cx cy w h  — all normalised)
+    label_path = LABELS_OUT_DIR / (img_path.stem + ".txt")
+    with open(label_path, "w") as f:
+        for box in boxes:
+            cx, cy, bw, bh = box.tolist()   # already normalised by DINO
+            f.write(f"0 {cx:.6f} {cy:.6f} {bw:.6f} {bh:.6f}\n")
+
+print(f"Done. Labels written: {len(images) - skipped}  Skipped (no detections): {skipped}")
+
+
+# ── CELL 5B: Build YOLOv8 detection dataset structure ────────
+#
+# Expected layout for YOLOv8-det:
 #   dataset/
-#     train/
-#       cracked/    ← images
-#       uncracked/  ← images
-#     val/
-#       cracked/
-#       uncracked/
-#     test/
-#       cracked/
-#       uncracked/
+#     images/
+#       train/  val/  test/
+#     labels/
+#       train/  val/  test/
+#
 
 import shutil
 from sklearn.model_selection import train_test_split
 
-YOLO_DIR = Path("/content/yolo_dataset")
-SPLITS = {"train": 0.75, "val": 0.15, "test": 0.10}
+YOLO_DET_DIR = Path("/content/yolo_det_dataset")
+labelled_images = [
+    p for p in images
+    if (LABELS_OUT_DIR / (p.stem + ".txt")).exists()
+]
 
-def build_split(images, label, split_dir):
-    dest = split_dir / label
-    dest.mkdir(parents=True, exist_ok=True)
-    for src in images:
-        shutil.copy(src, dest / src.name)
+# For uncracked images — label file is empty (no crack boxes)
+NEG_DIR = Path("/content/data/surface-crack-detection/Negative")
+neg_images = list(NEG_DIR.glob("*.jpg"))[:len(labelled_images)]
 
-# Split indices
-train_pos, temp_pos = train_test_split(pos, test_size=0.25, random_state=42)
-val_pos, test_pos   = train_test_split(temp_pos, test_size=0.40, random_state=42)
+all_images = [(p, True) for p in labelled_images] + [(p, False) for p in neg_images]
 
-train_neg, temp_neg = train_test_split(neg, test_size=0.25, random_state=42)
-val_neg, test_neg   = train_test_split(temp_neg, test_size=0.40, random_state=42)
+train, temp = train_test_split(all_images, test_size=0.25, random_state=42)
+val,   test = train_test_split(temp,       test_size=0.40, random_state=42)
 
-for split_name, (p_imgs, n_imgs) in [
-    ("train", (train_pos, train_neg)),
-    ("val",   (val_pos,   val_neg)),
-    ("test",  (test_pos,  test_neg)),
-]:
-    split_dir = YOLO_DIR / split_name
-    build_split(p_imgs, "cracked",   split_dir)
-    build_split(n_imgs, "uncracked", split_dir)
-    print(f"{split_name}: {len(p_imgs)} cracked, {len(n_imgs)} uncracked")
+def copy_split(items, split_name):
+    img_dir = YOLO_DET_DIR / "images" / split_name
+    lbl_dir = YOLO_DET_DIR / "labels" / split_name
+    img_dir.mkdir(parents=True, exist_ok=True)
+    lbl_dir.mkdir(parents=True, exist_ok=True)
 
-# ── CELL 6: Train YOLOv8-cls ─────────────────────────────────
+    for img_path, is_cracked in items:
+        shutil.copy(img_path, img_dir / img_path.name)
+        if is_cracked:
+            src_lbl = LABELS_OUT_DIR / (img_path.stem + ".txt")
+            if src_lbl.exists():
+                shutil.copy(src_lbl, lbl_dir / (img_path.stem + ".txt"))
+            else:
+                # Auto-labeling produced no boxes → empty label = uncracked
+                (lbl_dir / (img_path.stem + ".txt")).write_text("")
+        else:
+            # No crack → empty label file
+            (lbl_dir / (img_path.stem + ".txt")).write_text("")
+
+for name, items in [("train", train), ("val", val), ("test", test)]:
+    copy_split(items, name)
+    print(f"{name}: {len(items)} images")
+
+# Write data.yaml
+yaml_content = f"""
+path: {YOLO_DET_DIR}
+train: images/train
+val:   images/val
+test:  images/test
+
+nc: 1
+names: ['cracked']
+"""
+with open(YOLO_DET_DIR / "data.yaml", "w") as f:
+    f.write(yaml_content.strip())
+
+DATASET_YAML = str(YOLO_DET_DIR / "data.yaml")
+print("Dataset YAML written to:", DATASET_YAML)
+
+
+# ═══════════════════════════════════════════════════════════════
+# TRAINING — same for both Path A and Path B
+# ═══════════════════════════════════════════════════════════════
+
+# ── CELL 6: Train YOLOv8n-det ────────────────────────────────
 from ultralytics import YOLO
 
-# Load pretrained YOLOv8 nano classifier (smallest — fast to fine-tune)
-# For better accuracy use yolov8s-cls.pt (small) at cost of ~2x time
-model = YOLO("yolov8n-cls.pt")
+# Detection model — NOT the classifier
+# yolov8n.pt = nano (fastest, use for demo)
+# yolov8s.pt = small (~2× slower, ~3% better mAP)
+model = YOLO("yolov8n.pt")
 
 results = model.train(
-    data=str(YOLO_DIR),
-    epochs=30,           # 30 epochs ≈ 25 min on T4 — increase to 50 for production
-    imgsz=224,           # standard for classification
-    batch=64,
-    patience=10,         # early stopping
+    data=DATASET_YAML,
+    epochs=50,
+    imgsz=640,           # detection uses 640 (not 224 like classification)
+    batch=32,
+    patience=10,
     optimizer="AdamW",
     lr0=1e-3,
     lrf=0.01,
     cos_lr=True,
-    augment=True,        # built-in augmentation (flip, rotate, colour jitter)
-    dropout=0.3,         # regularisation
-    project="/content/runs",
-    name="crack_cls",
+    augment=True,
+    mosaic=1.0,          # mosaic augmentation — very effective for crack detection
+    mixup=0.1,
+    degrees=10,          # rotation augmentation — cracks appear at all angles
+    flipud=0.5,
+    fliplr=0.5,
+    hsv_h=0.015,
+    hsv_s=0.4,
+    hsv_v=0.2,
+    project="/content/runs_det",
+    name="crack_det",
     pretrained=True,
-    device=0,            # GPU 0; use 'cpu' if no GPU
+    device=0,
     save=True,
     verbose=True,
 )
 
 print("Best model saved to:", results.save_dir)
 
+
 # ── CELL 7: Evaluate on test set ─────────────────────────────
 from ultralytics import YOLO
-import json
 
-best_model = YOLO("/content/runs/crack_cls/weights/best.pt")
+best = YOLO("/content/runs_det/crack_det/weights/best.pt")
+metrics = best.val(data=DATASET_YAML, split="test")
 
-# Validate on test split
-metrics = best_model.val(data=str(YOLO_DIR), split="test")
-print(f"\nTest accuracy (top1): {metrics.top1:.4f}")
-print(f"Test accuracy (top5): {metrics.top5:.4f}")
+print(f"\nmAP50:    {metrics.box.map50:.4f}")
+print(f"mAP50-95: {metrics.box.map:.4f}")
+print(f"Precision:{metrics.box.p.mean():.4f}")
+print(f"Recall:   {metrics.box.r.mean():.4f}")
 
-# ── CELL 8: Confusion matrix + sample predictions ─────────────
+# Target benchmarks for SDNET2018:
+# mAP50 > 0.70 is good for hairline cracks (hard to detect)
+# mAP50 > 0.80 is excellent
+
+
+# ── CELL 8: Visualise predictions ────────────────────────────
 from ultralytics import YOLO
-import cv2, numpy as np
-import matplotlib.pyplot as plt
+import cv2, numpy as np, matplotlib.pyplot as plt
+from pathlib import Path
 
-best_model = YOLO("/content/runs/crack_cls/weights/best.pt")
+best = YOLO("/content/runs_det/crack_det/weights/best.pt")
 
-# Sample 8 test images and show predictions
-test_cracked   = list((YOLO_DIR / "test" / "cracked").glob("*.jpg"))[:4]
-test_uncracked = list((YOLO_DIR / "test" / "uncracked").glob("*.jpg"))[:4]
-samples = test_cracked + test_uncracked
+test_dir = Path(DATASET_YAML).parent / "images" / "test"
+samples  = list(test_dir.glob("*.jpg"))[:8]
 
-fig, axes = plt.subplots(2, 4, figsize=(14, 7))
-for idx, path in enumerate(samples):
-    r = best_model.predict(str(path), verbose=False)[0]
-    top_cls = r.probs.top1
-    conf    = r.probs.top1conf.item()
-    label   = r.names[top_cls]
-    img = cv2.cvtColor(cv2.imread(str(path)), cv2.COLOR_BGR2RGB)
+fig, axes = plt.subplots(2, 4, figsize=(16, 8))
+for idx, img_path in enumerate(samples):
+    result = best.predict(str(img_path), verbose=False, conf=0.25)[0]
+    annotated = result.plot()   # returns BGR numpy array with boxes drawn
     ax = axes[idx // 4][idx % 4]
-    ax.imshow(img)
-    colour = "tomato" if label == "cracked" else "limegreen"
-    ax.set_title(f"{label}\n{conf:.2%}", color=colour, fontsize=9)
+    ax.imshow(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+    n_boxes = len(result.boxes)
+    ax.set_title(f"{n_boxes} crack(s) found", fontsize=9,
+                 color="tomato" if n_boxes else "limegreen")
     ax.axis("off")
+
 plt.tight_layout()
-plt.savefig("/content/predictions.png", dpi=120)
+plt.savefig("/content/detection_predictions.png", dpi=130)
 plt.show()
+print("Saved to /content/detection_predictions.png")
+
 
 # ── CELL 9: Export to ONNX ───────────────────────────────────
-# ONNX runs on CPU without PyTorch — perfect for production server
-best_model = YOLO("/content/runs/crack_cls/weights/best.pt")
-onnx_path = best_model.export(format="onnx", imgsz=224, simplify=True, opset=17)
+best = YOLO("/content/runs_det/crack_det/weights/best.pt")
+
+onnx_path = best.export(
+    format="onnx",
+    imgsz=640,       # must match training imgsz
+    simplify=True,
+    opset=17,
+    dynamic=False,   # fixed batch=1 for API use
+)
 print("ONNX model exported to:", onnx_path)
 
-# ── CELL 10: Download model weights ──────────────────────────
-from google.colab import files
 
-# Download both .pt and .onnx — keep both
-files.download("/content/runs/crack_cls/weights/best.pt")
-files.download(str(onnx_path))
-print("Download both files and place them in: api/models/")
-
-# ── CELL 11: Quick inference test ────────────────────────────
+# ── CELL 10: Verify ONNX output shape ────────────────────────
 import onnxruntime as ort
 import numpy as np
-import cv2
-
-CLASS_NAMES = ["cracked", "uncracked"]  # order from training — verify with r.names
-
-def preprocess(img_path: str) -> np.ndarray:
-    img = cv2.imread(img_path)
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (224, 224))
-    img = img.astype(np.float32) / 255.0
-    # ImageNet normalisation
-    mean = np.array([0.485, 0.456, 0.406])
-    std  = np.array([0.229, 0.224, 0.225])
-    img  = (img - mean) / std
-    img  = img.transpose(2, 0, 1)           # HWC → CHW
-    return img[np.newaxis, :].astype(np.float32)  # add batch dim
 
 sess = ort.InferenceSession(str(onnx_path))
+print("Input  name :", sess.get_inputs()[0].name)
+print("Input  shape:", sess.get_inputs()[0].shape)
+print("Output name :", sess.get_outputs()[0].name)
+print("Output shape:", sess.get_outputs()[0].shape)
+# Expected output: [1, 5+num_classes, num_anchors]
+# For 1-class (cracked only): [1, 6, 8400]
+
+
+# ── CELL 11: Quick ONNX inference test ───────────────────────
+import onnxruntime as ort
+import numpy as np, cv2
+from pathlib import Path
+
+CONF_THRESHOLD = 0.25
+IOU_THRESHOLD  = 0.45
+
+sess       = ort.InferenceSession(str(onnx_path))
 input_name = sess.get_inputs()[0].name
 
-# Test on a sample image
-test_img = str(test_cracked[0])
-logits = sess.run(None, {input_name: preprocess(test_img)})[0][0]
-probs  = np.exp(logits) / np.exp(logits).sum()  # softmax
-pred   = CLASS_NAMES[np.argmax(probs)]
-conf   = float(np.max(probs))
+def letterbox(img, size=640):
+    h0, w0 = img.shape[:2]
+    scale   = size / max(h0, w0)
+    nh, nw  = int(h0 * scale), int(w0 * scale)
+    img     = cv2.resize(img, (nw, nh))
+    canvas  = np.full((size, size, 3), 114, np.uint8)
+    py      = (size - nh) // 2
+    px      = (size - nw) // 2
+    canvas[py:py+nh, px:px+nw] = img
+    return canvas, scale, px, py
 
-print(f"Image: {test_img}")
-print(f"Prediction: {pred}  ({conf:.2%} confidence)")
+test_img_path = str(samples[0])
+img_bgr = cv2.imread(test_img_path)
+letterboxed, scale, px, py = letterbox(img_bgr)
+tensor = (letterboxed[:,:,::-1].astype(np.float32) / 255.0)
+tensor = tensor.transpose(2,0,1)[np.newaxis,:]
 
-# ── CELL 12: Save class names for the API ────────────────────
+raw = sess.run(None, {input_name: tensor})[0]      # (1, 6, 8400)
+preds = raw[0].T                                   # (8400, 6)
+
+score = preds[:,4] * preds[:,5]
+mask  = score > CONF_THRESHOLD
+if mask.any():
+    p  = preds[mask]
+    s  = score[mask]
+    cx, cy, bw, bh = p[:,0], p[:,1], p[:,2], p[:,3]
+    x1 = ((cx - bw/2 - px) / scale).astype(int)
+    y1 = ((cy - bh/2 - py) / scale).astype(int)
+    x2 = ((cx + bw/2 - px) / scale).astype(int)
+    y2 = ((cy + bh/2 - py) / scale).astype(int)
+    print(f"Found {mask.sum()} boxes before NMS")
+    for i in range(min(3, len(x1))):
+        print(f"  Box {i}: ({x1[i]},{y1[i]}) → ({x2[i]},{y2[i]})  conf={s[i]:.2f}")
+else:
+    print("No detections above threshold on this sample.")
+
+
+# ── CELL 12: Download weights ─────────────────────────────────
+from google.colab import files
+
+files.download("/content/runs_det/crack_det/weights/best.pt")
+files.download(str(onnx_path))
+
+print("\nPlace the downloaded files in your project:")
+print("  best.pt               → api/models/crack_det_best.pt   (backup)")
+print("  crack_detector_det.onnx → api/models/crack_detector_det.onnx  ← API uses this")
+print("\nRename the ONNX file to: crack_detector_det.onnx")
+print("The API will automatically switch from MockDetector to Phase detection.")
+
+
+# ── CELL 13: Save class names ────────────────────────────────
 import json
-
-# IMPORTANT: Run this after training to capture the exact class order
-best_model_check = YOLO("/content/runs/crack_cls/weights/best.pt")
-dummy = best_model_check.predict(str(test_cracked[0]), verbose=False)[0]
-class_names = dummy.names  # {0: 'cracked', 1: 'uncracked'} — actual order
-
-with open("/content/class_names.json", "w") as f:
+class_names = {0: "cracked"}   # single class for detection
+with open("/content/class_names_det.json", "w") as f:
     json.dump(class_names, f, indent=2)
+files.download("/content/class_names_det.json")
+print("Place as: api/models/class_names.json")
 
-print("Class names:", class_names)
-files.download("/content/class_names.json")
-# Place this file in api/models/class_names.json
 
-# ── NOTES FOR SEVERITY CLASSIFICATION (Phase 2) ──────────────
+# ══ NOTES ════════════════════════════════════════════════════
 #
-# After binary classification works, add severity:
+# SEVERITY mapping (api/detector.py _box_severity):
+#   Hairline : box area < 0.5% of image
+#   Moderate : box area 0.5–4%
+#   Severe   : box area > 4%
 #
-# Strategy: Use crack WIDTH as a proxy for severity.
-# SDNET2018 images are 227×227px at known physical scale.
-# You can estimate crack width by:
-#   1. Thresholding the crack region (Otsu's method)
-#   2. Measuring the width of the thinnest connected component
-#   3. Mapping pixel width → physical width using image scale
+# You can tune these thresholds after reviewing predictions on
+# your real field images. The bounding box area is a strong proxy
+# for crack width when images are taken at a consistent distance.
 #
-# Severity labels:
-#   - Hairline: < 0.2 mm  (structural monitoring, low urgency)
-#   - Moderate:  0.2–0.5 mm (schedule inspection)
-#   - Severe:   > 0.5 mm  (immediate attention)
-#
-# Alternatively, train a 3-class classifier on manually labelled subsets.
-# This is left as Phase 2 — binary classification is already publishable.
+# PHASE 3 IDEAS:
+#   - Add a segmentation head (YOLOv8-seg) for pixel-level masks
+#   - Estimate crack width in mm using known image scale (GSD)
+#   - Track crack growth over time by comparing inspections at same location
+#   - Add a REST endpoint to export inspection reports as PDF
+# ═════════════════════════════════════════════════════════════
