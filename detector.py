@@ -1,23 +1,23 @@
 """
-Crack Detection Inference Engine — Phase 2 (Bounding Box Detection)
-====================================================================
-Supports two model modes, auto-selected at startup:
+CrackScan — Inference Engine  (Phase 1 + 2 + 3)
+================================================
+Model priority at startup:
 
-  Phase 2 (YOLOv8-det ONNX) — returns bounding boxes + class scores
-    Place weights at: api/models/crack_detector_det.onnx
+  Phase 3 → crack_detector_seg.onnx   YOLOv8n-seg  (pixel mask + EN 206 measurement)
+  Phase 2 → crack_detector_det.onnx   YOLOv8n-det  (bounding box severity)
+  Phase 1 → crack_detector.onnx       YOLOv8n-cls  (binary crack / no-crack)
+  Fallback → MockDetector             deterministic, no weights required
 
-  Phase 1 (YOLOv8-cls ONNX) — falls back to classification-only
-    Place weights at: api/models/crack_detector.onnx
-
-  Mock — deterministic fake results for development (no weights needed)
-
-Detection model input:  640×640 RGB image, normalised [0,1], NCHW float32
-Detection model output: [batch, 5+num_classes, num_anchors]  (YOLO format)
-                         columns: cx, cy, w, h, obj_conf, class_conf…
-
-Classification model input:  224×224 RGB, ImageNet-normalised, NCHW float32
-Classification model output: logits [batch, num_classes]
+Phase 3 pipeline
+----------------
+  image  →  letterbox 640×640  →  ONNX seg inference
+         →  decode predictions  →  NMS
+         →  reconstruct binary masks  →  calibrate (ArUco / LiDAR / EXIF / default)
+         →  measure each mask (skeletonize + EDT)
+         →  aggregate → EN 206 severity → DetectionResult
 """
+
+from __future__ import annotations
 
 import json
 import time
@@ -30,58 +30,76 @@ import numpy as np
 
 try:
     import onnxruntime as ort
-    ONNX_AVAILABLE = True
-except ImportError:
-    ONNX_AVAILABLE = False
+    _ONNX = True
+except ImportError:                          # pragma: no cover
+    _ONNX = False
 
-# ---------------------------------------------------------------------------
-# Paths
-# ---------------------------------------------------------------------------
+# ── Paths ────────────────────────────────────────────────────
 
-MODELS_DIR   = Path(__file__).parent / "models"
-ONNX_DET     = MODELS_DIR / "crack_detector_det.onnx"   # Phase 2 detection
-ONNX_CLS     = MODELS_DIR / "crack_detector.onnx"       # Phase 1 classification
-NAMES_PATH   = MODELS_DIR / "class_names.json"
+_MODELS = Path(__file__).parent / "models"
 
-# ---------------------------------------------------------------------------
-# Severity constants
-# ---------------------------------------------------------------------------
+SEG_ONNX   = _MODELS / "crack_detector_seg.onnx"   # Phase 3
+DET_ONNX   = _MODELS / "crack_detector_det.onnx"   # Phase 2
+CLS_ONNX   = _MODELS / "crack_detector.onnx"       # Phase 1
+NAMES_JSON = _MODELS / "class_names.json"
 
-SEVERITY_COLOR = {
-    "none":     "#00e5b0",
-    "hairline": "#ffe066",
-    "moderate": "#ffb347",
-    "severe":   "#ff5f6d",
+# ── Severity maps ────────────────────────────────────────────
+
+_SEV_COLOR = {
+    "none":     "#4caf50",
+    "hairline": "#2196f3",
+    "moderate": "#ff9800",
+    "severe":   "#f44336",
 }
-
-SEVERITY_ACTION = {
-    "none":     "No action required. Surface is in good condition.",
-    "hairline": "Monitor periodically. Document and re-inspect in 6–12 months.",
+_SEV_ACTION = {
+    "none":     "No action required.",
+    "hairline": "Monitor. Re-inspect in 6–12 months.",
     "moderate": "Schedule professional inspection within 3 months.",
-    "severe":   "Immediate structural assessment recommended.",
+    "severe":   "Immediate structural assessment required.",
+}
+_SEV_BGR = {
+    "none":     (100, 200, 100),
+    "hairline": (200, 200,   0),
+    "moderate": (  0, 160, 255),
+    "severe":   (  0,   0, 220),
 }
 
-# Colour used to draw bounding boxes per severity (BGR for OpenCV)
-SEVERITY_BGR = {
-    "none":     (0, 229, 176),
-    "hairline": (66, 228, 255),
-    "moderate": (51, 152, 255),
-    "severe":   (61,  63, 255),
-}
 
-# ---------------------------------------------------------------------------
-# Result dataclasses
-# ---------------------------------------------------------------------------
+def _conf_to_severity(conf: float) -> str:
+    """Phase 1 heuristic: raw confidence → severity bucket."""
+    if conf < 0.50: return "none"
+    if conf < 0.70: return "hairline"
+    if conf < 0.90: return "moderate"
+    return "severe"
+
+
+def _area_to_severity(area_frac: float) -> str:
+    """Phase 2 heuristic: bounding-box area fraction → severity."""
+    if area_frac < 0.005: return "hairline"
+    if area_frac < 0.040: return "moderate"
+    return "severe"
+
+
+def _width_to_severity(max_width_mm: float) -> str:
+    """Phase 3: EN 206 classification from measured crack width."""
+    if max_width_mm <= 0.00: return "none"
+    if max_width_mm <  0.20: return "hairline"
+    if max_width_mm <= 0.50: return "moderate"
+    return "severe"
+
+
+# ── Data classes ─────────────────────────────────────────────
 
 @dataclass
 class BoundingBox:
-    """A single detected crack bounding box."""
     x1: int
     y1: int
     x2: int
     y2: int
     confidence: float
-    severity: str           # hairline / moderate / severe (derived from box area)
+    severity: str
+    mask: Optional[np.ndarray] = field(default=None, repr=False, compare=False)
+    measurement: Optional[dict] = None      # CrackMeasurement.to_dict()
 
     @property
     def width(self) -> int:
@@ -91,494 +109,506 @@ class BoundingBox:
     def height(self) -> int:
         return self.y2 - self.y1
 
-    @property
-    def area_fraction(self) -> float:
-        """Fraction of image area (caller must set image_area first)."""
-        return (self.width * self.height)
+    def area_fraction(self, img_w: int, img_h: int) -> float:
+        return (self.width * self.height) / max(img_w * img_h, 1)
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "x1": self.x1, "y1": self.y1,
             "x2": self.x2, "y2": self.y2,
-            "width": self.width, "height": self.height,
+            "width":  self.width,
+            "height": self.height,
             "confidence": round(self.confidence, 4),
-            "severity": self.severity,
+            "severity":   self.severity,
         }
+        if self.measurement:
+            d["measurement"] = self.measurement
+        return d
 
 
 @dataclass
 class DetectionResult:
-    is_cracked: bool
-    confidence: float               # 0.0 – 1.0  (highest box conf, or cls conf)
-    severity: str                   # none / hairline / moderate / severe
-    severity_color: str
-    action: str
-    class_probabilities: dict       # {"cracked": 0.97, "uncracked": 0.03}
-    inference_time_ms: float
-    model_version: str = "yolov8n-det-sdnet2018"
-    bounding_boxes: list = field(default_factory=list)   # list[BoundingBox]
-    detection_mode: str = "detection"                    # "detection" | "classification" | "mock"
+    is_cracked:          bool
+    confidence:          float
+    severity:            str
+    action:              str
+    class_probabilities: dict
+    inference_time_ms:   float
+    model_version:       str
+    detection_mode:      str   # "segmentation" | "detection" | "classification" | "mock"
+    bounding_boxes:      list[BoundingBox] = field(default_factory=list)
+    # Phase 3 measurement fields
+    measurement_aggregate:   dict  = field(default_factory=dict)
+    calibration_method:      str   = "none"
+    px_per_mm:               float = 0.0
+    calibration_uncertainty: float = 0.0
+
+    @property
+    def severity_color(self) -> str:
+        return _SEV_COLOR.get(self.severity, "#9e9e9e")
 
     def boxes_as_dicts(self) -> list[dict]:
         return [b.to_dict() for b in self.bounding_boxes]
 
 
-# ---------------------------------------------------------------------------
-# Shared image pre/post processing
-# ---------------------------------------------------------------------------
+# ── Image preprocessing ───────────────────────────────────────
 
-CLS_SIZE = 224
-DET_SIZE = 640
-
-IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
-
-
-def preprocess_cls(img_bgr: np.ndarray) -> np.ndarray:
-    """BGR image → NCHW float32 for classification model (224×224, ImageNet-norm)."""
-    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (CLS_SIZE, CLS_SIZE), interpolation=cv2.INTER_LINEAR)
-    img = img.astype(np.float32) / 255.0
-    img = (img - IMAGENET_MEAN) / IMAGENET_STD
-    img = img.transpose(2, 0, 1)
-    return img[np.newaxis, :]
+def _letterbox(
+    img: np.ndarray, size: int = 640
+) -> tuple[np.ndarray, float, int, int]:
+    """Pad image to square while preserving aspect ratio."""
+    h0, w0   = img.shape[:2]
+    scale    = size / max(h0, w0)
+    nh, nw   = int(h0 * scale), int(w0 * scale)
+    resized  = cv2.resize(img, (nw, nh))
+    canvas   = np.full((size, size, 3), 114, np.uint8)
+    py, px   = (size - nh) // 2, (size - nw) // 2
+    canvas[py:py + nh, px:px + nw] = resized
+    return canvas, scale, px, py
 
 
-def preprocess_det(img_bgr: np.ndarray) -> tuple[np.ndarray, float, int, int]:
+def _to_tensor(img_bgr: np.ndarray, size: int = 640):
+    """Letterbox + BGR→RGB + normalise + NCHW."""
+    lb, scale, pad_x, pad_y = _letterbox(img_bgr, size)
+    tensor = lb[:, :, ::-1].astype(np.float32) / 255.0
+    tensor = np.ascontiguousarray(tensor.transpose(2, 0, 1)[np.newaxis, :])
+    return tensor, scale, pad_x, pad_y
+
+
+# ── NMS ──────────────────────────────────────────────────────
+
+def _nms(boxes_cxywh: np.ndarray, scores: np.ndarray, iou_thr: float = 0.45):
+    """Pure-numpy Non-Maximum Suppression."""
+    if len(boxes_cxywh) == 0:
+        return []
+    x1 = boxes_cxywh[:, 0] - boxes_cxywh[:, 2] / 2
+    y1 = boxes_cxywh[:, 1] - boxes_cxywh[:, 3] / 2
+    x2 = boxes_cxywh[:, 0] + boxes_cxywh[:, 2] / 2
+    y2 = boxes_cxywh[:, 1] + boxes_cxywh[:, 3] / 2
+    areas = (x2 - x1).clip(0) * (y2 - y1).clip(0)
+    order = scores.argsort()[::-1]
+    keep  = []
+    while len(order):
+        i = order[0]
+        keep.append(int(i))
+        if len(order) == 1:
+            break
+        ix1 = np.maximum(x1[i], x1[order[1:]])
+        iy1 = np.maximum(y1[i], y1[order[1:]])
+        ix2 = np.minimum(x2[i], x2[order[1:]])
+        iy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, ix2 - ix1) * np.maximum(0, iy2 - iy1)
+        iou   = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        order = order[1:][iou < iou_thr]
+    return keep
+
+
+# ── Segmentation mask reconstruction ─────────────────────────
+
+def _sigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (1.0 + np.exp(-np.clip(x, -88.0, 88.0)))
+
+
+def _reconstruct_mask(
+    coeffs:          np.ndarray,   # [32]
+    protos:          np.ndarray,   # [32, 160, 160]
+    box_xyxy_input:  tuple,        # (x1,y1,x2,y2) in input-space pixels
+    orig_shape:      tuple,        # (H, W) of the original image
+    input_size:      int = 640,
+    proto_size:      int = 160,
+) -> np.ndarray:
     """
-    BGR image → NCHW float32 for detection model (640×640, [0,1]-norm).
-    Returns: (tensor, scale, pad_x, pad_y)
-    scale and pad values are needed to map predicted boxes back to original coords.
+    Reconstruct a binary segmentation mask from YOLOv8-seg outputs.
+
+    The coefficient vector for each detection is combined with the shared
+    prototype masks (a linear combination), then sigmoid-activated, cropped
+    to the bounding box, and upsampled to original image resolution.
     """
-    h0, w0 = img_bgr.shape[:2]
-    scale = DET_SIZE / max(h0, w0)
-    nh, nw = int(h0 * scale), int(w0 * scale)
+    mask_logits = (coeffs @ protos.reshape(32, -1)).reshape(proto_size, proto_size)
+    mask        = _sigmoid(mask_logits)
 
-    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    img = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LINEAR)
+    ps = proto_size / input_size
+    x1p = max(0,          int(box_xyxy_input[0] * ps))
+    y1p = max(0,          int(box_xyxy_input[1] * ps))
+    x2p = min(proto_size, int(box_xyxy_input[2] * ps))
+    y2p = min(proto_size, int(box_xyxy_input[3] * ps))
 
-    # Letterbox: pad to 640×640 with grey (114)
-    canvas = np.full((DET_SIZE, DET_SIZE, 3), 114, dtype=np.uint8)
-    pad_y = (DET_SIZE - nh) // 2
-    pad_x = (DET_SIZE - nw) // 2
-    canvas[pad_y:pad_y + nh, pad_x:pad_x + nw] = img
+    cropped = np.zeros((proto_size, proto_size), dtype=np.float32)
+    if x2p > x1p and y2p > y1p:
+        cropped[y1p:y2p, x1p:x2p] = mask[y1p:y2p, x1p:x2p]
 
-    tensor = canvas.astype(np.float32) / 255.0
-    tensor = tensor.transpose(2, 0, 1)      # HWC → CHW
-    return tensor[np.newaxis, :], scale, pad_x, pad_y
-
-
-def softmax(logits: np.ndarray) -> np.ndarray:
-    e = np.exp(logits - logits.max())
-    return e / e.sum()
+    H, W = orig_shape
+    full = cv2.resize(cropped, (W, H), interpolation=cv2.INTER_LINEAR)
+    return (full > 0.5).astype(np.uint8) * 255
 
 
-# ---------------------------------------------------------------------------
-# Phase 2: bounding box post-processing
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────
+# Detectors
+# ─────────────────────────────────────────────────────────────
 
-IOU_THRESHOLD  = 0.45
-CONF_THRESHOLD = 0.25   # minimum objectness × class_conf to keep a box
-
-
-def decode_detections(
-    raw: np.ndarray,
-    scale: float,
-    pad_x: int,
-    pad_y: int,
-    orig_h: int,
-    orig_w: int,
-    conf_thresh: float = CONF_THRESHOLD,
-    iou_thresh:  float = IOU_THRESHOLD,
-) -> list[BoundingBox]:
+class SegmentationDetector:
     """
-    Decode raw ONNX detection output → list of BoundingBox in original image coords.
+    Phase 3: YOLOv8n-seg ONNX.
+    Decodes segmentation masks, calibrates, runs measurement pipeline.
 
-    YOLO detection head output shape: [1, 5+num_cls, num_anchors]
-      row layout: cx, cy, w, h, obj_conf, cls0_conf, cls1_conf, …
-
-    We assume class 0 = cracked (the only class we care about).
+    ONNX output shapes:
+      output0: [1, 4+nc+32, 8400]  — box + class + mask coefficients
+      output1: [1, 32, 160, 160]   — prototype masks
     """
-    # raw shape: (1, num_outputs, num_anchors) — transpose to (num_anchors, num_outputs)
-    preds = raw[0].T          # (num_anchors, 5 + num_classes)
 
-    boxes_out: list[BoundingBox] = []
+    MODEL_VERSION = "yolov8n-seg-sdnet2018-v3"
+    INPUT_SIZE    = 640
+    CONF_THR      = 0.25
+    IOU_THR       = 0.45
 
-    # Filter by objectness × class confidence
-    obj_conf  = preds[:, 4]
-    cls_conf  = preds[:, 5] if preds.shape[1] > 5 else obj_conf
-    score     = obj_conf * cls_conf
-    mask      = score > conf_thresh
-
-    if not mask.any():
-        return boxes_out
-
-    preds  = preds[mask]
-    scores = score[mask]
-
-    # cx, cy, w, h → x1, y1, x2, y2 (in letterboxed 640×640 space)
-    cx, cy, bw, bh = preds[:, 0], preds[:, 1], preds[:, 2], preds[:, 3]
-    x1 = cx - bw / 2
-    y1 = cy - bh / 2
-    x2 = cx + bw / 2
-    y2 = cy + bh / 2
-
-    # NMS
-    boxes_np = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
-    indices  = cv2.dnn.NMSBoxes(
-        bboxes=boxes_np.tolist(),
-        scores=scores.tolist(),
-        score_threshold=conf_thresh,
-        nms_threshold=iou_thresh,
-    )
-    if len(indices) == 0:
-        return boxes_out
-
-    indices = indices.flatten()
-    img_area = orig_h * orig_w
-
-    for idx in indices:
-        # Map back: remove padding, undo scale
-        rx1 = int((boxes_np[idx, 0] - pad_x) / scale)
-        ry1 = int((boxes_np[idx, 1] - pad_y) / scale)
-        rx2 = int((boxes_np[idx, 2] - pad_x) / scale)
-        ry2 = int((boxes_np[idx, 3] - pad_y) / scale)
-
-        # Clip to image bounds
-        rx1 = max(0, min(rx1, orig_w - 1))
-        ry1 = max(0, min(ry1, orig_h - 1))
-        rx2 = max(rx1 + 1, min(rx2, orig_w))
-        ry2 = max(ry1 + 1, min(ry2, orig_h))
-
-        box_area_frac = ((rx2 - rx1) * (ry2 - ry1)) / img_area
-        severity = _box_severity(box_area_frac)
-
-        boxes_out.append(BoundingBox(
-            x1=rx1, y1=ry1, x2=rx2, y2=ry2,
-            confidence=float(scores[idx]),
-            severity=severity,
-        ))
-
-    return boxes_out
-
-
-def _box_severity(area_fraction: float) -> str:
-    """Map detected crack bounding-box area (fraction of image) → severity label."""
-    if area_fraction < 0.005:
-        return "hairline"
-    elif area_fraction < 0.04:
-        return "moderate"
-    else:
-        return "severe"
-
-
-def _aggregate_severity(boxes: list[BoundingBox]) -> str:
-    """Worst-case severity across all detected boxes."""
-    order = {"hairline": 1, "moderate": 2, "severe": 3}
-    if not boxes:
-        return "none"
-    return max(boxes, key=lambda b: order.get(b.severity, 0)).severity
-
-
-# ---------------------------------------------------------------------------
-# Overlay rendering (Phase 2 — annotated bounding boxes)
-# ---------------------------------------------------------------------------
-
-def draw_boxes_overlay(img_bgr: np.ndarray, boxes: list[BoundingBox]) -> np.ndarray:
-    """
-    Draw colour-coded bounding boxes + confidence labels on the image.
-    Returns a copy; original is NOT modified.
-    """
-    overlay = img_bgr.copy()
-    h, w = overlay.shape[:2]
-
-    for box in boxes:
-        color = SEVERITY_BGR.get(box.severity, (61, 63, 255))
-        # Main rectangle
-        cv2.rectangle(overlay, (box.x1, box.y1), (box.x2, box.y2), color, 2)
-
-        # Label background
-        label = f"{box.severity.upper()}  {box.confidence:.0%}"
-        (lw, lh), baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-        label_y = max(box.y1 - 6, lh + baseline)
-        cv2.rectangle(
-            overlay,
-            (box.x1, label_y - lh - baseline),
-            (box.x1 + lw + 6, label_y + baseline),
-            color, -1,
+    def __init__(self, model_path: Path):
+        self._sess = ort.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
         )
-        cv2.putText(
-            overlay, label,
-            (box.x1 + 3, label_y),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.45,
-            (0, 0, 0), 1, cv2.LINE_AA,
-        )
+        self._input_name = self._sess.get_inputs()[0].name
+        out0_shape = self._sess.get_outputs()[0].shape
+        # dim1 = 4 (box) + nc (classes) + 32 (mask coeffs)
+        self._nc = max(1, out0_shape[1] - 36)
 
-    return overlay
+    def predict(
+        self,
+        img_bgr: np.ndarray,
+        exif_bytes:        Optional[bytes] = None,
+        lidar_distance_m:  Optional[float] = None,
+        manual_px_per_mm:  Optional[float] = None,
+    ) -> DetectionResult:
+        from api.calibration import calibrate
+        from api.measurement import measure_mask, aggregate_measurements
 
-
-# ---------------------------------------------------------------------------
-# Phase 1 severity heuristic (kept for classification-mode fallback)
-# ---------------------------------------------------------------------------
-
-def estimate_severity_cls(img_bgr: np.ndarray, is_cracked: bool) -> str:
-    if not is_cracked:
-        return "none"
-
-    gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-    edges   = cv2.Canny(blurred, 50, 150)
-
-    h, w = edges.shape
-    edge_ratio = np.count_nonzero(edges) / (h * w)
-
-    kernel  = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(thresh, kernel, iterations=1)
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    max_area    = max((cv2.contourArea(c) for c in contours), default=0)
-    area_ratio  = max_area / (h * w)
-
-    if edge_ratio < 0.03 and area_ratio < 0.01:
-        return "hairline"
-    elif edge_ratio < 0.08 and area_ratio < 0.05:
-        return "moderate"
-    else:
-        return "severe"
-
-
-def draw_severity_overlay(img_bgr: np.ndarray) -> np.ndarray:
-    """Phase 1 contour overlay — used when only the cls model is available."""
-    gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    _, thresh = cv2.threshold(blurred, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    kernel  = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(thresh, kernel, iterations=2)
-    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-
-    overlay = img_bgr.copy()
-    h, w = img_bgr.shape[:2]
-    min_area = h * w * 0.001
-    large = [c for c in contours if cv2.contourArea(c) > min_area]
-    cv2.drawContours(overlay, large, -1, (0, 255, 128), 2)
-    return overlay
-
-
-# ---------------------------------------------------------------------------
-# Phase 2 — YOLOv8 Detection Detector
-# ---------------------------------------------------------------------------
-
-class CrackDetectorDet:
-    """
-    Phase 2: YOLOv8-det ONNX model.
-    Returns bounding boxes for each crack region.
-
-    Expected model export:
-        yolo export model=crack_det.pt format=onnx imgsz=640 simplify=True opset=17
-    """
-
-    def __init__(self, onnx_path: Path = ONNX_DET, names_path: Path = NAMES_PATH):
-        if not ONNX_AVAILABLE:
-            raise RuntimeError("onnxruntime not installed.")
-        if not onnx_path.exists():
-            raise FileNotFoundError(f"Detection ONNX not found at {onnx_path}")
-
-        if names_path.exists():
-            with open(names_path) as f:
-                raw = json.load(f)
-            self.class_names = {int(k): v for k, v in raw.items()}
-        else:
-            self.class_names = {0: "cracked"}
-
-        sess_opts = ort.SessionOptions()
-        sess_opts.inter_op_num_threads = 2
-        sess_opts.intra_op_num_threads = 2
-        self.session = ort.InferenceSession(
-            str(onnx_path),
-            sess_options=sess_opts,
-            providers=["CPUExecutionProvider"],
-        )
-        self.input_name  = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
-
-    def predict(self, img_bgr: np.ndarray) -> DetectionResult:
-        h0, w0 = img_bgr.shape[:2]
         t0 = time.perf_counter()
+        H, W = img_bgr.shape[:2]
+        tensor, scale, pad_x, pad_y = _to_tensor(img_bgr, self.INPUT_SIZE)
 
-        tensor, scale, pad_x, pad_y = preprocess_det(img_bgr)
-        raw = self.session.run([self.output_name], {self.input_name: tensor})[0]
+        out0, out1 = self._sess.run(None, {self._input_name: tensor})
+        preds  = out0[0].T          # [8400, 4+nc+32]
+        protos = out1[0]            # [32, 160, 160]
 
-        t1 = time.perf_counter()
-        inference_ms = (t1 - t0) * 1000
+        nc     = self._nc
+        scores = preds[:, 4:4 + nc].max(axis=1)
+        boxes  = preds[:, :4]
+        coeffs = preds[:, 4 + nc:]
 
-        boxes = decode_detections(raw, scale, pad_x, pad_y, h0, w0)
-        is_cracked = len(boxes) > 0
-        severity   = _aggregate_severity(boxes)
-        confidence = max((b.confidence for b in boxes), default=0.0) if boxes else 0.0
+        keep_mask = scores > self.CONF_THR
+        if not keep_mask.any():
+            infer_ms = (time.perf_counter() - t0) * 1000
+            return self._empty_result(float(scores.max()), infer_ms)
 
-        # Pseudo class probabilities derived from top confidence
-        crack_prob = float(confidence) if is_cracked else 1.0 - float(confidence)
-        class_probs = {
-            "cracked":   round(crack_prob, 4),
-            "uncracked": round(1.0 - crack_prob, 4),
-        }
+        f_scores = scores[keep_mask]
+        f_boxes  = boxes[keep_mask]
+        f_coeffs = coeffs[keep_mask]
+
+        keep = _nms(f_boxes, f_scores, self.IOU_THR)
+
+        # Calibrate once per image
+        calib = calibrate(img_bgr, exif_bytes, lidar_distance_m, manual_px_per_mm)
+
+        bboxes:       list[BoundingBox] = []
+        measurements: list              = []
+
+        for idx in keep:
+            cx, cy, bw, bh = f_boxes[idx]
+            x1 = max(0, int((cx - bw / 2 - pad_x) / scale))
+            y1 = max(0, int((cy - bh / 2 - pad_y) / scale))
+            x2 = min(W, int((cx + bw / 2 - pad_x) / scale))
+            y2 = min(H, int((cy + bh / 2 - pad_y) / scale))
+
+            box_in = (cx - bw/2, cy - bh/2, cx + bw/2, cy + bh/2)
+            seg_mask = _reconstruct_mask(f_coeffs[idx], protos, box_in, (H, W))
+
+            m = measure_mask(seg_mask, calib.px_per_mm, calib.uncertainty)
+            measurements.append(m)
+
+            sev = (
+                _width_to_severity(m.max_width_mm) if m.max_width_mm > 0
+                else _area_to_severity(((x2 - x1) * (y2 - y1)) / (W * H))
+            )
+
+            bboxes.append(BoundingBox(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=float(f_scores[idx]),
+                severity=sev,
+                mask=seg_mask,
+                measurement=m.to_dict(),
+            ))
+
+        agg  = aggregate_measurements(measurements)
+        sev  = agg.get("en206_class", "none") if bboxes else "none"
+        conf = max(b.confidence for b in bboxes) if bboxes else 0.0
 
         return DetectionResult(
-            is_cracked=is_cracked,
-            confidence=round(confidence, 4),
-            severity=severity,
-            severity_color=SEVERITY_COLOR[severity],
-            action=SEVERITY_ACTION[severity],
-            class_probabilities=class_probs,
-            inference_time_ms=round(inference_ms, 2),
-            model_version="yolov8n-det-sdnet2018",
-            bounding_boxes=boxes,
+            is_cracked=bool(bboxes),
+            confidence=round(float(conf), 4),
+            severity=sev,
+            action=_SEV_ACTION[sev],
+            class_probabilities={"cracked": round(float(conf), 4),
+                                  "uncracked": round(1 - float(conf), 4)},
+            inference_time_ms=round((time.perf_counter() - t0) * 1000, 2),
+            model_version=self.MODEL_VERSION,
+            detection_mode="segmentation",
+            bounding_boxes=bboxes,
+            measurement_aggregate=agg,
+            calibration_method=calib.method,
+            px_per_mm=round(calib.px_per_mm, 3),
+            calibration_uncertainty=round(calib.uncertainty, 3),
+        )
+
+    def _empty_result(self, max_score: float, infer_ms: float) -> DetectionResult:
+        return DetectionResult(
+            is_cracked=False,
+            confidence=round(float(max_score), 4),
+            severity="none",
+            action=_SEV_ACTION["none"],
+            class_probabilities={"cracked": 0.0, "uncracked": 1.0},
+            inference_time_ms=round(infer_ms, 2),
+            model_version=self.MODEL_VERSION,
+            detection_mode="segmentation",
+            measurement_aggregate={
+                "max_width_mm": 0.0, "total_length_mm": 0.0,
+                "total_area_mm2": 0.0, "crack_count": 0,
+                "en206_class": "none", "width_uncertainty_mm": 0.0,
+            },
+        )
+
+
+class DetectionDetector:
+    """
+    Phase 2: YOLOv8n-det ONNX.
+    Bounding box detection with area-based severity heuristic.
+
+    ONNX output shape: [1, 4+nc, 8400]
+    """
+
+    MODEL_VERSION = "yolov8n-det-sdnet2018-v2"
+    INPUT_SIZE    = 640
+    CONF_THR      = 0.25
+    IOU_THR       = 0.45
+
+    def __init__(self, model_path: Path):
+        self._sess = ort.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
+        )
+        self._input_name = self._sess.get_inputs()[0].name
+        self._nc = max(1, self._sess.get_outputs()[0].shape[1] - 4)
+
+    def predict(self, img_bgr: np.ndarray, **_) -> DetectionResult:
+        t0 = time.perf_counter()
+        H, W = img_bgr.shape[:2]
+        tensor, scale, pad_x, pad_y = _to_tensor(img_bgr, self.INPUT_SIZE)
+
+        raw = self._sess.run(None, {self._input_name: tensor})[0]
+        preds  = raw[0].T                       # [8400, 4+nc]
+        boxes  = preds[:, :4]
+        scores = preds[:, 4:4 + self._nc].max(axis=1)
+
+        keep_mask = scores > self.CONF_THR
+        if not keep_mask.any():
+            infer_ms = (time.perf_counter() - t0) * 1000
+            return DetectionResult(
+                is_cracked=False,
+                confidence=float(scores.max()),
+                severity="none",
+                action=_SEV_ACTION["none"],
+                class_probabilities={"cracked": 0.0, "uncracked": 1.0},
+                inference_time_ms=round(infer_ms, 2),
+                model_version=self.MODEL_VERSION,
+                detection_mode="detection",
+            )
+
+        keep = _nms(boxes[keep_mask], scores[keep_mask], self.IOU_THR)
+        f_boxes  = boxes[keep_mask]
+        f_scores = scores[keep_mask]
+
+        bboxes: list[BoundingBox] = []
+        for idx in keep:
+            cx, cy, bw, bh = f_boxes[idx]
+            x1 = max(0, int((cx - bw / 2 - pad_x) / scale))
+            y1 = max(0, int((cy - bh / 2 - pad_y) / scale))
+            x2 = min(W, int((cx + bw / 2 - pad_x) / scale))
+            y2 = min(H, int((cy + bh / 2 - pad_y) / scale))
+            sev = _area_to_severity(((x2 - x1) * (y2 - y1)) / (W * H))
+            bboxes.append(BoundingBox(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=float(f_scores[idx]),
+                severity=sev,
+            ))
+
+        sev  = max(bboxes, key=lambda b: list(_SEV_ACTION).index(b.severity) if b.severity in _SEV_ACTION else 0).severity if bboxes else "none"
+        conf = max(b.confidence for b in bboxes) if bboxes else 0.0
+
+        return DetectionResult(
+            is_cracked=bool(bboxes),
+            confidence=round(conf, 4),
+            severity=sev,
+            action=_SEV_ACTION[sev],
+            class_probabilities={"cracked": round(conf, 4),
+                                  "uncracked": round(1 - conf, 4)},
+            inference_time_ms=round((time.perf_counter() - t0) * 1000, 2),
+            model_version=self.MODEL_VERSION,
             detection_mode="detection",
+            bounding_boxes=bboxes,
         )
 
 
-# ---------------------------------------------------------------------------
-# Phase 1 — YOLOv8 Classification Detector (unchanged, kept as fallback)
-# ---------------------------------------------------------------------------
+class ClassificationDetector:
+    """
+    Phase 1: YOLOv8n-cls ONNX. Binary crack / no-crack.
 
-class CrackDetectorCls:
-    """Phase 1 classification-only detector. Used when det model is absent."""
+    ONNX output shape: [1, num_classes]
+    """
 
-    def __init__(self, onnx_path: Path = ONNX_CLS, names_path: Path = NAMES_PATH):
-        if not ONNX_AVAILABLE:
-            raise RuntimeError("onnxruntime not installed.")
-        if not onnx_path.exists():
-            raise FileNotFoundError(f"Classification ONNX not found at {onnx_path}")
+    MODEL_VERSION = "yolov8n-cls-sdnet2018-v1"
+    INPUT_SIZE    = 224
 
-        if names_path.exists():
-            with open(names_path) as f:
+    def __init__(self, model_path: Path):
+        self._sess = ort.InferenceSession(
+            str(model_path), providers=["CPUExecutionProvider"]
+        )
+        self._input_name = self._sess.get_inputs()[0].name
+        # Load class names
+        if NAMES_JSON.exists():
+            with open(NAMES_JSON) as f:
                 raw = json.load(f)
-            self.class_names = {int(k): v for k, v in raw.items()}
+            # class_names.json can be {0: "cracked", 1: "uncracked"} or list
+            if isinstance(raw, dict):
+                self._classes = [raw[str(i)] for i in range(len(raw))]
+            else:
+                self._classes = raw
         else:
-            self.class_names = {0: "cracked", 1: "uncracked"}
+            self._classes = ["cracked", "uncracked"]
 
-        sess_opts = ort.SessionOptions()
-        sess_opts.inter_op_num_threads = 2
-        sess_opts.intra_op_num_threads = 2
-        self.session = ort.InferenceSession(
-            str(onnx_path),
-            sess_options=sess_opts,
-            providers=["CPUExecutionProvider"],
-        )
-        self.input_name  = self.session.get_inputs()[0].name
-        self.output_name = self.session.get_outputs()[0].name
+    @staticmethod
+    def _softmax(x: np.ndarray) -> np.ndarray:
+        e = np.exp(x - x.max())
+        return e / e.sum()
 
-    def predict(self, img_bgr: np.ndarray) -> DetectionResult:
+    def predict(self, img_bgr: np.ndarray, **_) -> DetectionResult:
         t0 = time.perf_counter()
 
-        tensor = preprocess_cls(img_bgr)
-        logits = self.session.run([self.output_name], {self.input_name: tensor})[0][0]
-        probs  = softmax(logits)
+        img = cv2.resize(img_bgr, (self.INPUT_SIZE, self.INPUT_SIZE))
+        tensor = img[:, :, ::-1].astype(np.float32) / 255.0
+        tensor = np.ascontiguousarray(tensor.transpose(2, 0, 1)[np.newaxis, :])
 
-        t1 = time.perf_counter()
-        inference_ms = (t1 - t0) * 1000
+        raw = self._sess.run(None, {self._input_name: tensor})[0][0]
+        probs = self._softmax(raw)
 
-        top_idx    = int(np.argmax(probs))
-        top_conf   = float(probs[top_idx])
-        top_label  = self.class_names[top_idx]
-        is_cracked = top_label == "cracked"
-
-        severity = estimate_severity_cls(img_bgr, is_cracked)
-
-        class_probs = {
-            self.class_names[i]: round(float(p), 4)
-            for i, p in enumerate(probs)
-        }
+        class_probs = {name: float(probs[i]) for i, name in enumerate(self._classes)}
+        crack_prob  = class_probs.get("cracked", float(probs[0]))
+        is_cracked  = crack_prob >= 0.5
+        sev         = _conf_to_severity(crack_prob) if is_cracked else "none"
 
         return DetectionResult(
             is_cracked=is_cracked,
-            confidence=round(top_conf, 4),
-            severity=severity,
-            severity_color=SEVERITY_COLOR[severity],
-            action=SEVERITY_ACTION[severity],
+            confidence=round(crack_prob, 4),
+            severity=sev,
+            action=_SEV_ACTION[sev],
             class_probabilities=class_probs,
-            inference_time_ms=round(inference_ms, 2),
-            model_version="yolov8n-cls-sdnet2018",
-            bounding_boxes=[],
+            inference_time_ms=round((time.perf_counter() - t0) * 1000, 2),
+            model_version=self.MODEL_VERSION,
             detection_mode="classification",
         )
 
 
-# ---------------------------------------------------------------------------
-# Mock Detector (development — no weights required)
-# ---------------------------------------------------------------------------
-
 class MockDetector:
     """
-    Returns plausible fake results including synthetic bounding boxes.
-    Automatically used when no ONNX weights are present.
+    Deterministic fallback — no weights required.
+    Results cycle through all severity levels for easy UI testing.
     """
 
-    def predict(self, img_bgr: np.ndarray) -> DetectionResult:
-        import random
-        gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
-        mean_brightness = float(gray.mean())
+    MODEL_VERSION = "mock-v1"
 
-        crack_prob = max(0.05, min(0.98, 1.0 - (mean_brightness / 255)))
-        is_cracked = crack_prob > 0.5
-        conf = crack_prob if is_cracked else (1.0 - crack_prob)
+    _CYCLE = [
+        (False, 0.04, "none"),
+        (True,  0.62, "hairline"),
+        (True,  0.81, "moderate"),
+        (True,  0.96, "severe"),
+    ]
+    _counter = 0
+
+    def predict(self, img_bgr: np.ndarray, **_) -> DetectionResult:
+        t0 = time.perf_counter()
+        is_cracked, conf, sev = self._CYCLE[MockDetector._counter % 4]
+        MockDetector._counter += 1
 
         boxes: list[BoundingBox] = []
-
         if is_cracked:
-            h, w = img_bgr.shape[:2]
-            num_boxes = random.randint(1, 3)
-            for _ in range(num_boxes):
-                x1 = random.randint(0, w // 2)
-                y1 = random.randint(0, h // 2)
-                x2 = random.randint(x1 + 20, min(x1 + w // 3, w))
-                y2 = random.randint(y1 + 10, min(y1 + h // 3, h))
-                box_conf = random.uniform(0.55, 0.97)
-                area_frac = ((x2 - x1) * (y2 - y1)) / (h * w)
-                boxes.append(BoundingBox(
-                    x1=x1, y1=y1, x2=x2, y2=y2,
-                    confidence=round(box_conf, 4),
-                    severity=_box_severity(area_frac),
-                ))
-
-        severity = _aggregate_severity(boxes) if boxes else "none"
+            H, W = img_bgr.shape[:2]
+            x1, y1 = int(W * 0.2), int(H * 0.2)
+            x2, y2 = int(W * 0.8), int(H * 0.8)
+            boxes.append(BoundingBox(x1=x1, y1=y1, x2=x2, y2=y2,
+                                     confidence=conf, severity=sev))
 
         return DetectionResult(
             is_cracked=is_cracked,
-            confidence=round(conf, 4),
-            severity=severity,
-            severity_color=SEVERITY_COLOR[severity],
-            action=SEVERITY_ACTION[severity],
-            class_probabilities={
-                "cracked":   round(crack_prob, 4),
-                "uncracked": round(1 - crack_prob, 4),
-            },
-            inference_time_ms=round(__import__("random").uniform(8, 40), 2),
-            model_version="mock-det-demo",
-            bounding_boxes=boxes,
+            confidence=conf,
+            severity=sev,
+            action=_SEV_ACTION[sev],
+            class_probabilities={"cracked": conf, "uncracked": round(1 - conf, 4)},
+            inference_time_ms=round((time.perf_counter() - t0) * 1000, 2),
+            model_version=self.MODEL_VERSION,
             detection_mode="mock",
+            bounding_boxes=boxes,
         )
 
 
-# ---------------------------------------------------------------------------
-# Factory — auto-selects det → cls → mock
-# ---------------------------------------------------------------------------
+# ── Loader ────────────────────────────────────────────────────
 
 def load_detector():
     """
-    Priority:
-      1. Phase 2 detection model  (crack_detector_det.onnx)
-      2. Phase 1 classification   (crack_detector.onnx)
-      3. MockDetector             (development fallback)
+    Load the highest-capability available detector.
+    Prints a startup banner so the user knows which mode is active.
     """
-    if ONNX_DET.exists():
-        print(f"[detector] Phase 2 — Loading detection ONNX from {ONNX_DET}")
-        return CrackDetectorDet()
-    if ONNX_CLS.exists():
-        print(f"[detector] Phase 1 — Loading classification ONNX from {ONNX_CLS}")
-        return CrackDetectorCls()
-    print("[detector] WARNING: No ONNX model found — using MockDetector (Phase 2 mode).")
-    print(f"[detector] For Phase 2: place model at {ONNX_DET}")
-    print(f"[detector] For Phase 1: place model at {ONNX_CLS}")
+    if _ONNX:
+        for path, cls, label in [
+            (SEG_ONNX, SegmentationDetector,   "Phase 3 — Segmentation + Measurement"),
+            (DET_ONNX, DetectionDetector,       "Phase 2 — Bounding Box Detection"),
+            (CLS_ONNX, ClassificationDetector,  "Phase 1 — Classification"),
+        ]:
+            if path.exists():
+                try:
+                    det = cls(path)
+                    print(f"[CrackScan] ✓ {label}  ({path.name})")
+                    return det
+                except Exception as e:
+                    print(f"[CrackScan] ✗ Failed to load {path.name}: {e}")
+
+    print("[CrackScan] ⚠  MockDetector active — place ONNX weights in api/models/ "
+          "to enable real inference.")
     return MockDetector()
+
+
+# ── Overlay helpers ───────────────────────────────────────────
+
+def draw_segmentation_overlay(img_bgr: np.ndarray, boxes: list[BoundingBox]) -> np.ndarray:
+    """Phase 3: tinted mask fill + bounding rect + measurement annotation."""
+    from api.measurement import draw_segmentation_overlay as _draw
+    return _draw(img_bgr, boxes)
+
+
+def draw_boxes_overlay(img_bgr: np.ndarray, boxes: list[BoundingBox]) -> np.ndarray:
+    """Phase 2: coloured bounding rectangles with severity label."""
+    out = img_bgr.copy()
+    for b in boxes:
+        color = _SEV_BGR.get(b.severity, (200, 200, 200))
+        cv2.rectangle(out, (b.x1, b.y1), (b.x2, b.y2), color, 2)
+        label = f"{b.severity.upper()} {b.confidence:.0%}"
+        lx, ly = b.x1, max(b.y1 - 6, 14)
+        cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(out, label, (lx, ly), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
+                    (255, 255, 255), 1, cv2.LINE_AA)
+    return out
+
+
+def draw_severity_overlay(img_bgr: np.ndarray) -> np.ndarray:
+    """Phase 1 fallback: edge contour highlight for classified-as-cracked images."""
+    gray    = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    edges   = cv2.Canny(gray, 50, 150)
+    dilated = cv2.dilate(edges, np.ones((3, 3), np.uint8))
+    out     = img_bgr.copy()
+    out[dilated > 0] = (0, 80, 255)
+    return out
