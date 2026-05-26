@@ -1,9 +1,9 @@
 """
-CrackScan — Test Suite
+CrackScan Phase 2 — Test Suite
 ================================
 Covers: preprocessing, softmax, severity heuristics, bounding box
 decoding, overlay rendering, MockDetector (with boxes), and all
-database operations including the new columns.
+database operations including the new Phase 2 columns.
 
 Run: pytest tests/ -v   (no model weights required)
 """
@@ -152,8 +152,8 @@ class TestBoundingBox:
 
     def test_width_height(self):
         b = self._make_box()
-        assert b.width == 50
-        assert b.height == 60
+        assert b.box_width == 50
+        assert b.box_height == 60
 
     def test_to_dict_keys(self):
         d = self._make_box().to_dict()
@@ -208,6 +208,61 @@ class TestAggregateSeverity:
         from api.detector import _aggregate_severity, BoundingBox
         boxes = [BoundingBox(0,0,10,10,0.8,"moderate")]
         assert _aggregate_severity(boxes) == "moderate"
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Width measurement & severity
+# ---------------------------------------------------------------------------
+
+class TestMeasureCrackWidth:
+    def test_empty_crop_returns_zero(self, blank_img):
+        from api.detector import measure_crack_width_px, BoundingBox
+        # Box outside image or zero area
+        b = BoundingBox(x1=0, y1=0, x2=0, y2=0, confidence=0.9, severity="none")
+        assert measure_crack_width_px(blank_img, b) == 0.0
+
+    def test_no_crack_pixels_returns_zero(self, blank_img):
+        from api.detector import measure_crack_width_px, BoundingBox
+        b = BoundingBox(x1=10, y1=10, x2=50, y2=50, confidence=0.9, severity="none")
+        assert measure_crack_width_px(blank_img, b) == 0.0
+
+    def test_synthetic_crack_width(self):
+        from api.detector import measure_crack_width_px, BoundingBox
+        import cv2
+        # White background (concrete)
+        img = np.full((100, 100, 3), 255, dtype=np.uint8)
+        # Draw a 6px thick black line
+        cv2.line(img, (20, 50), (80, 50), (0, 0, 0), thickness=6)
+
+        b = BoundingBox(x1=10, y1=10, x2=90, y2=90, confidence=0.9, severity="none")
+        w_px = measure_crack_width_px(img, b)
+
+        # Distance transform medial axis value for 6px line is around 3-4, *2 = 6-8
+        assert 5.0 <= w_px <= 8.5
+
+class TestSeverityByWidth:
+    def test_hairline(self):
+        from api.detector import classify_severity_by_width
+        assert classify_severity_by_width(0.1) == "hairline"
+        assert classify_severity_by_width(0.19) == "hairline"
+
+    def test_moderate(self):
+        from api.detector import classify_severity_by_width
+        assert classify_severity_by_width(0.2) == "moderate"
+        assert classify_severity_by_width(0.49) == "moderate"
+
+    def test_severe(self):
+        from api.detector import classify_severity_by_width
+        assert classify_severity_by_width(0.5) == "severe"
+        assert classify_severity_by_width(1.5) == "severe"
+
+class TestBoundingBoxWidth:
+    def test_to_dict_includes_width(self):
+        from api.detector import BoundingBox
+        b = BoundingBox(x1=10, y1=10, x2=50, y2=50, confidence=0.9, severity="moderate", width_px=10.0, width_mm=0.25)
+        d = b.to_dict()
+        assert d["crack_width_px"] == 10.0
+        assert d["crack_width_mm"] == 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -324,6 +379,7 @@ class TestMockDetector:
         assert isinstance(MockDetector().predict(blank_img), DetectionResult)
 
     def test_dark_image_likely_cracked(self, dark_img):
+        from api.detector import MockDetector
         assert MockDetector().predict(dark_img).is_cracked
 
     def test_bright_image_likely_uncracked(self, bright_img):
@@ -380,11 +436,18 @@ class TestMockDetector:
         from api.detector import MockDetector
         assert MockDetector().predict(blank_img).detection_mode == "mock"
 
+    def test_mock_generates_width_values(self, dark_img):
+        from api.detector import MockDetector
+        r = MockDetector().predict(dark_img)
+        for b in r.bounding_boxes:
+            assert b.width_px is not None and b.width_px > 0
+            assert b.width_mm is not None and b.width_mm > 0
+
     def test_boxes_as_dicts(self, dark_img):
         from api.detector import MockDetector
         r = MockDetector().predict(dark_img)
         for d in r.boxes_as_dicts():
-            for key in ("x1","y1","x2","y2","confidence","severity"):
+            for key in ("x1","y1","x2","y2","confidence","severity","crack_width_px","crack_width_mm"):
                 assert key in d
 
 
@@ -400,12 +463,13 @@ class TestDatabase:
         ).fetchall()]
         assert "inspections" in tables
 
-    def test_phase2_columns_exist(self, tmp_db):
+    def test_phase3_columns_exist(self, tmp_db):
         conn = tmp_db.get_connection()
         cols = {row[1] for row in conn.execute("PRAGMA table_info(inspections)").fetchall()}
         assert "bounding_boxes" in cols
         assert "box_count"      in cols
         assert "detection_mode" in cols
+        assert "scale_mm_per_px" in cols
 
     def test_save_returns_id(self, tmp_db):
         row_id = tmp_db.save_inspection(
@@ -416,17 +480,20 @@ class TestDatabase:
         assert isinstance(row_id, int) and row_id > 0
 
     def test_save_with_bounding_boxes(self, tmp_db):
-        boxes = [{"x1":10,"y1":20,"x2":60,"y2":80,"confidence":0.9,"severity":"moderate"}]
+        boxes = [{"x1":10,"y1":20,"x2":60,"y2":80,"confidence":0.9,"severity":"moderate","crack_width_px":10.5,"crack_width_mm":0.4}]
         row_id = tmp_db.save_inspection(
             is_cracked=True, confidence=0.9, severity="moderate",
             action="Schedule inspection", class_probs={"cracked":0.9,"uncracked":0.1},
             infer_ms=18.0, bounding_boxes=boxes, detection_mode="detection",
+            scale_mm_per_px=0.8,
         )
         rows = tmp_db.get_inspections(limit=1)
         assert rows[0]["box_count"] == 1
         assert rows[0]["detection_mode"] == "detection"
+        assert rows[0]["scale_mm_per_px"] == 0.8
         assert isinstance(rows[0]["bounding_boxes"], list)
         assert rows[0]["bounding_boxes"][0]["severity"] == "moderate"
+        assert rows[0]["bounding_boxes"][0]["crack_width_mm"] == 0.4
 
     def test_default_detection_mode_is_classification(self, tmp_db):
         tmp_db.save_inspection(

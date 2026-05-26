@@ -1,5 +1,5 @@
 # ============================================================
-# Concrete Crack Detector — Training Notebook
+# CrackScan Phase 2 — Bounding Box Detection Training
 # Run cell-by-cell in Google Colab (free T4 GPU)
 #
 # Two paths:
@@ -369,7 +369,7 @@ print("\nPlace the downloaded files in your project:")
 print("  best.pt               → api/models/crack_det_best.pt   (backup)")
 print("  crack_detector_det.onnx → api/models/crack_detector_det.onnx  ← API uses this")
 print("\nRename the ONNX file to: crack_detector_det.onnx")
-print("The API will automatically switch from MockDetector to Phase detection.")
+print("The API will automatically switch from MockDetector to Phase 2 detection.")
 
 
 # ── CELL 13: Save class names ────────────────────────────────

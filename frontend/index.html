@@ -2,8 +2,13 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no"/>
+<meta name="theme-color" content="#080a09"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<meta name="description" content="AI-powered concrete surface crack detection with width measurement and severity classification."/>
 <title>CrackScan — Concrete Inspection AI</title>
+<link rel="manifest" href="manifest.json"/>
 <link href="https://fonts.googleapis.com/css2?family=Syne:wght@400;600;700;800&family=DM+Mono:wght@400;500&family=DM+Sans:wght@300;400;500&display=swap" rel="stylesheet"/>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -254,7 +259,7 @@ tr:hover td{background:var(--card2);}
   <div class="logo"><div class="logo-crack"></div></div>
   <div>
     <div class="hdr-title">CrackScan</div>
-    <div class="hdr-sub">EN 206 · Phase 2 — Bounding Box Detection</div>
+    <div class="hdr-sub">EN 206 · Phase 3 — Width-Based Severity</div>
   </div>
   <nav class="hdr-nav">
     <button class="nav-btn active" id="navScan" onclick="showView('scan')">Inspect</button>
@@ -288,7 +293,7 @@ tr:hover td{background:var(--card2);}
 
       <!-- GPS + note -->
       <div style="margin-top:1rem;">
-        <div class="rc-title" style="margin-bottom:.5rem;">Location (optional)</div>
+        <div class="rc-title" style="margin-bottom:.5rem;">Location & Scale (optional)</div>
         <div class="gps-row">
           <div class="field-mini"><label>Latitude</label><input type="number" id="lat" placeholder="36.8065" step="any"/></div>
           <div class="field-mini"><label>Longitude</label><input type="number" id="lng" placeholder="10.1815" step="any"/></div>
@@ -298,6 +303,10 @@ tr:hover td{background:var(--card2);}
           <input type="text" id="locName" placeholder="e.g. Tunis Ring Road — Pier 12"/>
         </div>
         <button class="geo-btn" onclick="getGPS()">⊕ Use my current location</button>
+        <div class="field-mini" style="margin-top:6px;">
+          <label>Scale (mm/px) — <span style="color:var(--text3);cursor:help" title="Ground Sampling Distance: how many millimetres each pixel represents. Default 0.78 is calibrated for SDNET2018 (256px ≈ 200mm). Adjust for your camera distance.">?</span></label>
+          <input type="number" id="scaleMmPx" placeholder="0.78" step="0.01" min="0.01" value="0.78"/>
+        </div>
         <div class="field-mini" style="margin-top:6px;">
           <label>Inspector note</label>
           <textarea id="note" placeholder="e.g. North face of column, water visible"></textarea>
@@ -430,6 +439,8 @@ async function analyse() {
   if (lng) form.append('longitude', lng);
   if (locName) form.append('location_name', locName);
   if (note) form.append('user_note', note);
+  const scaleMmPx = document.getElementById('scaleMmPx').value;
+  if (scaleMmPx && parseFloat(scaleMmPx) > 0) form.append('scale_mm_per_px', scaleMmPx);
 
   try {
     const res = await fetch(`${API}/detect`, { method:'POST', body: form });
@@ -460,19 +471,22 @@ function renderResults(d, panel) {
   const modeLabel = {detection:'Phase 2 · Detection', classification:'Phase 1 · Classification', mock:'Mock · Dev'}[d.detection_mode] || d.detection_mode;
   const modeCls   = {detection:'mode-det', classification:'mode-cls', mock:'mode-mock'}[d.detection_mode] || 'mode-mock';
 
-  // Bounding box list HTML (Phase 2 only)
+  // Bounding box list HTML (Phase 3 — with width measurement)
   let boxesHtml = '';
   if (d.bounding_boxes && d.bounding_boxes.length > 0) {
-    const rows = d.bounding_boxes.map((b, i) => `
-      <div class="box-row">
+    const rows = d.bounding_boxes.map((b, i) => {
+      const widthStr = b.crack_width_mm != null ? `${b.crack_width_mm.toFixed(1)} mm` : '—';
+      return `
+      <div class="box-row" style="grid-template-columns:auto 1fr auto auto auto;">
         <span class="box-idx">#${i+1}</span>
         <span class="box-coords">(${b.x1},${b.y1}) → (${b.x2},${b.y2}) · ${b.width}×${b.height}px</span>
+        <span style="font-family:var(--mono);font-size:10px;color:var(--text)">${widthStr}</span>
         <span class="sev-chip ${sevClass(b.severity)}" style="font-size:9px;padding:2px 7px;">
           <span class="sev-dot" style="background:${sevColor(b.severity)};width:5px;height:5px;"></span>${b.severity}
         </span>
         <span class="box-conf">${(b.confidence*100).toFixed(0)}%</span>
       </div>
-    `).join('');
+    `}).join('');
     boxesHtml = `
     <div class="result-card">
       <div class="rc-header">
@@ -507,6 +521,17 @@ function renderResults(d, panel) {
         </span>
       </div>
       <div class="rc-body">
+        ${(() => {
+          // Phase 3: show widest measured crack width
+          const widths = (d.bounding_boxes||[]).filter(b => b.crack_width_mm != null).map(b => b.crack_width_mm);
+          const maxWidth = widths.length > 0 ? Math.max(...widths) : null;
+          return maxWidth != null ? `
+            <div style="font-family:var(--display);font-size:24px;font-weight:800;color:${sevColor(sev)};margin-bottom:8px;">
+              ${maxWidth.toFixed(2)} mm
+            </div>
+            <div style="font-family:var(--mono);font-size:11px;color:var(--text3);margin-bottom:10px;">Widest measured crack · Scale: ${d.scale_mm_per_px || 0.78} mm/px</div>
+          ` : '';
+        })()}
         <div class="conf-bar-track">
           <div class="conf-bar-fill" style="width:${conf}%;background:${sevColor(sev)}"></div>
         </div>
@@ -603,6 +628,55 @@ function renderTable(rows) {
     </tr>`;
   }).join('');
 }
+</script>
+
+<!-- Phase 4: Capacitor.js native bridge (only loads inside native shell) -->
+<script>
+(function() {
+  // Detect Capacitor native environment
+  if (window.Capacitor && window.Capacitor.isNativePlatform && window.Capacitor.isNativePlatform()) {
+    console.log('[CrackScan] Running inside Capacitor native shell');
+
+    // Override getGPS to use Capacitor Geolocation plugin
+    if (window.Capacitor.Plugins && window.Capacitor.Plugins.Geolocation) {
+      window._originalGetGPS = window.getGPS;
+      window.getGPS = async function() {
+        try {
+          const pos = await window.Capacitor.Plugins.Geolocation.getCurrentPosition({ enableHighAccuracy: true });
+          document.getElementById('lat').value = pos.coords.latitude.toFixed(6);
+          document.getElementById('lng').value = pos.coords.longitude.toFixed(6);
+        } catch(err) {
+          console.warn('[Capacitor] Geolocation error, falling back to browser API');
+          if (window._originalGetGPS) window._originalGetGPS();
+        }
+      };
+    }
+
+    // Override openCamera to use Capacitor Camera plugin
+    if (window.Capacitor.Plugins && window.Capacitor.Plugins.Camera) {
+      window._originalOpenCamera = window.openCamera;
+      window.openCamera = async function() {
+        try {
+          const photo = await window.Capacitor.Plugins.Camera.getPhoto({
+            quality: 90,
+            source: 'CAMERA',
+            resultType: 'uri',
+          });
+          // Convert Capacitor URI to blob and pass to setFile
+          const response = await fetch(photo.webPath);
+          const blob = await response.blob();
+          const file = new File([blob], 'capture.jpg', { type: 'image/jpeg' });
+          setFile(file);
+        } catch(err) {
+          console.warn('[Capacitor] Camera error, falling back to file input');
+          if (window._originalOpenCamera) window._originalOpenCamera();
+        }
+      };
+    }
+  } else {
+    console.log('[CrackScan] Running in browser mode');
+  }
+})();
 </script>
 
 </body>

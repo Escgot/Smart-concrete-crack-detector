@@ -1,10 +1,10 @@
-# 🏗️ CrackScan — Concrete Crack Detector (Phase 2)
+# 🏗️ CrackScan — Concrete Crack Detector
 
-> **AI-powered structural surface inspection and asset management.** > Upload a field photo to receive automated bounding-box localization, precise severity classification, and a GPS-tagged inspection log designed for civil infrastructure monitoring.
+> **AI-powered structural surface inspection and asset management.** > Upload a field photo to receive automated crack detection, severity classification, and a GPS-tagged inspection log designed for civil infrastructure monitoring.
 
-**Tech Stack:** YOLOv8-det · ONNX Runtime · FastAPI · Vanilla JS  
-**Training Pipeline:** Grounding DINO · SAM (Zero-shot Auto-labeling)  
-**Compliance Standard:** Informed by EN 206 crack classification principles  
+**Tech Stack:** YOLOv8 · ONNX Runtime · FastAPI · Vanilla JS · Capacitor.js  
+**Dataset:** SDNET2018 (56,000 labeled concrete images)  
+**Compliance Standard:** Informed by EN 206 crack classification principles (Width-based)
 
 ---
 
@@ -14,25 +14,28 @@
 crack-detector/
 ├── api/
 │   ├── main.py         ← FastAPI routes (/detect, /inspections, /stats)
-│   ├── detector.py     ← YOLOv8 NMS + Bounding Box decode + Severity heuristics
-│   ├── database.py     ← SQLite inspection log (Phase 2 schema)
+│   ├── detector.py     ← ONNX inference engine + width measurement algorithm
+│   ├── database.py     ← SQLite inspection log (stores crack widths)
 │   └── models/
-│       ├── crack_detector_det.onnx   ← Phase 2: Detection weights (add after training)
-│       └── crack_detector.onnx       ← Phase 1: Classification fallback
+│       ├── crack_detector_det.onnx   ← (add after training)
+│       └── class_names.json          ← (add after training)
 ├── frontend/
-│   └── index.html      ← Full inspector UI with Canvas Box Drawing
+│   ├── index.html      ← Full inspector UI (PWA + Capacitor bridge)
+│   └── manifest.json   ← PWA manifest
 ├── notebooks/
-│   └── train_colab_phase2.py ← Detection training script (Path A & B)
+│   └── train_colab_phase2.py  ← Training script (run in Google Colab)
 ├── tests/
-│   └── test_detector.py ← Unit tests (preprocessing, NMS, DB logic)
+│   └── test_detector.py ← Unit tests (preprocessing, width calc, severity mapping)
 ├── Dockerfile
-└── requirements.txt
+├── requirements.txt
+├── package.json        ← Capacitor JS dependencies
+└── capacitor.config.ts ← Capacitor configuration for iOS/Android
 ```
 ---
 
 ## 🚀 Quick Start (Mock Model — No Training Needed)
 
-You can demo the full API, UI, and synthetic bounding boxes without training the model first. The engine auto-selects the best available model (Phase 2 Det → Phase 1 Cls → Mock).
+You can demo the full API and frontend without training the model first. If no ONNX weights are found, the system automatically falls back to a deterministic `MockDetector`.
 
 ```bash
 # 1. Install dependencies
@@ -47,7 +50,7 @@ open frontend/index.html
 python -m http.server 3000 --directory frontend
 ```
 
-**API Documentation**: Available at http://localhost:8001/docs
+API docs at: http://localhost:8001/docs
 
 ---
 
@@ -60,75 +63,85 @@ Enable GPU acceleration: Runtime → Change runtime type → T4 GPU (free).
 
 ### Step 2 — Fetch the Dataset
 
-Path A: The Fast Path (Roboflow)
-Use a pre-labeled detection dataset directly from Roboflow via the API.
-This bypasses the need for manual labeling and moves straight into YOLOv8 training.
+Option A (Recommended): Use Kaggle via API.  
+```
+# Upload kaggle.json to Colab, then:
+kaggle datasets download -d arunrk7/surface-crack-detection -p /content/data --unzip
+```
 
-Path B: The AI-Engineering Path (Grounding DINO)
-Keep the original SDNET2018 dataset and use a zero-shot vision model (Grounding DINO) to automatically scan all 20,000 positive images, identify the cracks, and generate YOLO-format `.txt` bounding box labels without human intervention.
+Option B: Search for the "SDNET2018 dataset" on UCI/Mendeley and download manually.
 
-### Step 3 — Export and Deploy Weights
+### Step 3 — Execute Training
 
-Once training completes, the notebook exports an ONNX graph. Download the weights and place them in the `api/models/` directory:
+Training takes ~25 minutes on T4 GPU.  
+Run all cells in the notebook. Training takes approximately 25 minutes on a T4 GPU.
 
-Place both production files in the `api/models/` directory:
+*Expected validation accuracy: >92% using YOLOv8n-cls.*
+
+### Step 4 — Export and Deploy Weights
+
+The notebook will generate and download the following:
+- `best.pt` — PyTorch weights (keep as backup)
+- `crack_detector.onnx` — Highly optimized weights for production deployment.
+- `class_names.json` — class order index from training
+
+Place both production files in the `api/models/`directory:
 ```
 api/models/crack_detector.onnx
 api/models/class_names.json
 ```
 
-*Restart the API. The engine will detect `crack_detector_det.onnx` and automatically upgrade the UI and endpoints to Phase 2 mode.*
+*Restart the API. It will automatically detect the weights and switch from the `MockDetector` to the live `CrackDetector` engine.*
 
 ---
 
 ## 📡 API Reference
 
 ### `POST /detect`
-Submit an image to the inference engine and receive localized bounding boxes.
+Submit an image to the inference engine and receive a localized assessment.
 
 ```bash
 curl -X POST http://localhost:8001/detect \
   -F "file=@/path/to/concrete.jpg" \
   -F "latitude=36.8065" \
-  -F "longitude=10.1815"
+  -F "longitude=10.1815" \
+  -F "location_name=Tunis Ring Road Pier 12" \
+  -F "user_note=North face, moisture visible"
 ```
 
 Standard Response:
 ```json
 {
-  "inspection_id": 43,
+  "inspection_id": 42,
   "is_cracked": true,
-  "confidence": 0.9421,
+  "confidence": 0.9732,
   "severity": "moderate",
   "severity_color": "#ff9833",
   "action": "Schedule professional inspection within 3 months.",
-  "class_probabilities": {"cracked": 0.9421, "uncracked": 0.0579},
-  "inference_time_ms": 24.1,
-  "overlay_url": "/uploads/xyz789_overlay.jpg",
+  "class_probabilities": {"cracked": 0.9732, "uncracked": 0.0268},
+  "inference_time_ms": 18.4,
+  "overlay_url": "/uploads/abc123_overlay.jpg",
   "model_version": "yolov8n-det-sdnet2018",
   "detection_mode": "detection",
-  "box_count": 2,
+  "box_count": 1,
+  "scale_mm_per_px": 0.78,
   "bounding_boxes": [
     {
-      "x1": 120, "y1": 45, "x2": 180, "y2": 310,
-      "width": 60, "height": 265,
-      "confidence": 0.9421,
-      "severity": "moderate"
-    },
-    {
-      "x1": 400, "y1": 200, "x2": 450, "y2": 280,
-      "width": 50, "height": 80,
-      "confidence": 0.7812,
-      "severity": "hairline"
+      "x1": 150, "y1": 100, "x2": 250, "y2": 300,
+      "width": 100, "height": 200,
+      "confidence": 0.9732,
+      "severity": "moderate",
+      "crack_width_px": 3.8,
+      "crack_width_mm": 2.96
     }
   ]
 }
 ```
 
 ### `GET /inspections`
-Retrieve the GPS-tagged inspection log, now supporting bounding box arrays.
+Retrieve the GPS-tagged inspection log.
 ```
-?limit=50&offset=0&mode=detection&severity=severe
+?limit=50&offset=0&severity=severe
 ```
 
 ### `GET /stats`
@@ -136,16 +149,23 @@ Fetch aggregated dashboard statistics (total logs, crack rates, severity distrib
 
 ---
 
-## 📐 Severity Classification Heuristic
+## 📐 Phase 3: Width-Based Severity Measurement
 
-| Severity | Visual indicator | Recommended action |
-|----------|-----------------|-------------------|
-| None     | 0 boxes detected | No action required |
-| Hairline | < 0.5% of image area | Monitor, re-inspect in 6–12 months |
-| Moderate | 0.5% – 4.0% of image area | Schedule inspection within 3 months |
-| Severe   | > 4.0% of image area | Immediate structural assessment |
+Phase 3 introduces a physically-grounded severity classification. Instead of mapping bounding-box area fractions, the system:
+1. Skeletonizes the crack pixels inside each bounding box
+2. Measures the perpendicular width at sample points along the skeleton
+3. Takes the 95th percentile width in pixels
+4. Multiplies by the `scale_mm_per_px` (Ground Sampling Distance) to find the width in mm
+5. Maps to the EN 206 severity thresholds:
 
-⚠️ Disclaimer: This automated heuristic is indicative only. It is designed to assist asset managers in triaging field data and should always be confirmed with a professional structural assessment.
+| Crack Width (mm) | Severity | Visual indicator | Recommended action |
+|------------------|----------|-----------------|-------------------|
+| 0                | None     | No crack detected | No action required |
+| < 0.2 mm         | Hairline | Very fine crack   | Monitor, re-inspect in 6–12 months |
+| 0.2–0.5 mm       | Moderate | Visible crack     | Schedule inspection within 3 months |
+| > 0.5 mm         | Severe   | Wide crack        | Immediate structural assessment |
+
+⚠️ *Disclaimer: Scale calibration depends on camera distance. The default 0.78 mm/px assumes SDNET2018 parameters (camera ~30 cm from surface).*
 
 ---
 
@@ -162,17 +182,38 @@ docker run -p 8001:8001 crackscan-api
 Connect your GitHub repository and set the start command to:  
 `uvicorn api.main:app --host 0.0.0.0 --port $PORT`
 
-### Frontend (Static)
-The `frontend/index.html` file is entirely self-contained. and renders the bounding box overlays seamlessly. Deploy to Netlify by dragging the `frontend/` folder into the dashboard.
+### Frontend (Browser / PWA)
+The `frontend/index.html` file is entirely self-contained.  
+It includes a PWA manifest (`manifest.json`) for installation on mobile browsers.
+To deploy via Netlify, drag the `frontend/` folder into the Netlify dashboard.
+Update the `API` constant in the JavaScript to point to your live backend URL.
+
+### Phase 4: Mobile App (Capacitor.js)
+The frontend is wrapped with Capacitor.js to compile as a native iOS/Android application.
+To build the mobile app:
+```bash
+# 1. Install Node.js dependencies
+npm install
+
+# 2. Sync the frontend code into the native projects
+npx cap sync
+
+# 3. Open in Android Studio / Xcode to build
+npx cap open android
+# or
+npx cap open ios
+```
+The Capacitor bridge automatically replaces the browser camera and geolocation APIs with native device plugins when running inside the app shell.
 
 ---
 
 ## 🧪 Testing
 
-The robust test suite validates image preprocessing, mathematical stability, NMS (Non-Maximum Suppression) box decoding, severity logic, the Mock fallback, and the Phase 2 SQLite database schema.
+The test suite covers image preprocessing, mathematical stability (softmax validation), the severity heuristic, the MockDetector fallback, and all database operations. Model weights are not required to run tests.
+
 ```bash
 pytest tests/ -v
-# Output: All tests passed (Model weights not required)
+# 30 passed — no model weights required
 ```
 
 Tests cover: preprocessing, softmax stability, severity heuristic, MockDetector, all database operations.

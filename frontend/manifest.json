@@ -1,0 +1,17 @@
+{
+  "name": "CrackScan",
+  "short_name": "CrackScan",
+  "description": "Concrete Crack Detector AI App",
+  "start_url": "index.html",
+  "display": "standalone",
+  "background_color": "#080a09",
+  "theme_color": "#080a09",
+  "icons": [
+    {
+      "src": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCA1MTIgNTEyIj4KICA8cmVjdCB3aWR0aD0iMTAwJSIgaGVpZ2h0PSIxMDAlIiBmaWxsPSIjMzlmZjdhIiByeD0iMjAiLz4KICA8cGF0aCBkPSJNMjUwIDYwIEwyMTAgMjYwIEwyMzAgMjYwIEwxODAgNDYwIiBzdHJva2U9IiMwMDAiIHN0cm9rZS13aWR0aD0iNDAiIGZpbGw9Im5vbmUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIgc3Ryb2tlLWxpbmVqb2luPSJyb3VuZCIvPgogIDxwYXRoIGQ9Ik0xODAgMjYwIEwyMzAgMzEwIiBzdHJva2U9IiMwMDAiIHN0cm9rZS13aWR0aD0iNDAiIGZpbGw9Im5vbmUiIHN0cm9rZS1saW5lY2FwPSJyb3VuZCIvPgo8L3N2Zz4=",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
