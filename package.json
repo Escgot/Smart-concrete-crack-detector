@@ -4,6 +4,7 @@
   "description": "Concrete Crack Detector AI App",
   "main": "index.js",
   "scripts": {
+    "dev": "python -m http.server 3000 --directory frontend",
     "cap:init": "cap init",
     "cap:sync": "cap sync",
     "cap:android": "cap open android",
